@@ -1,0 +1,15 @@
+# Build output
+/build/
+/out/
+
+# The game files are copyrighted and must be supplied by whoever builds.
+/src/rom/*
+!/src/rom/README.md
+
+# Original dump + Ghidra project kept next to the repo by the maintainer
+/rom/
+/emulator/
+
+# Runtime data written by the port (saves, cache partitions, logs)
+/src/userdata/
+*.log

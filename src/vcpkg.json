@@ -1,0 +1,8 @@
+{
+  "name": "swbf2-native",
+  "version-string": "0.1.0",
+  "description": "Native PC runtime for Star Wars Battlefront II (Xbox)",
+  "dependencies": [
+    "sdl2"
+  ]
+}

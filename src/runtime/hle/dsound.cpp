@@ -6,7 +6,9 @@
 // thread and played through SDL. Supported: 8/16-bit PCM and Xbox ADPCM,
 // play/loop regions, frequency, volume, mix-bin routing (downmixed to
 // stereo), submix (MIXIN) buffers, stream packet completion via events or
-// callbacks. Hardware effects (I3DL2 reverb, HRTF) are not reproduced.
+// callbacks, voice headroom, and DS3D positional voices (panned from their
+// position, with distance rolloff). Hardware effects (I3DL2 reverb, HRTF
+// filtering) are not reproduced.
 #include "hook.h"
 #include "../host/audio.h"
 #include "../kernel/kfuncs.h"
@@ -77,6 +79,25 @@ struct XMEDIAPACKET {
 struct XMEDIAINFO {
     uint32_t dwFlags, dwInputSize, dwOutputSize, dwMaxLookahead;
 };
+struct D3DVECTOR_ {
+    float x, y, z;
+};
+struct DS3DBUFFER {
+    uint32_t dwSize;
+    D3DVECTOR_ vPosition, vVelocity;
+    uint32_t dwInsideConeAngle, dwOutsideConeAngle;
+    D3DVECTOR_ vConeOrientation;
+    int32_t lConeOutsideVolume;
+    float flMinDistance, flMaxDistance;
+    uint32_t dwMode;
+    float flDistanceFactor, flRolloffFactor, flDopplerFactor;
+};
+struct DS3DLISTENER {
+    uint32_t dwSize;
+    D3DVECTOR_ vPosition, vVelocity, vOrientFront, vOrientTop;
+    float flDistanceFactor, flRolloffFactor, flDopplerFactor;
+};
+static_assert(sizeof(DS3DBUFFER) == 76 && sizeof(DS3DLISTENER) == 64);
 
 constexpr int32_t DS_OK = 0;
 constexpr int32_t E_FAIL_ = int32_t(0x80004005);
@@ -89,6 +110,7 @@ constexpr uint32_t DSBPLAY_LOOPING = 1, DSBPLAY_FROMSTART = 2, DSBPLAY_SYNCHPLAY
 constexpr uint32_t DSBSTATUS_PLAYING = 1, DSBSTATUS_PAUSED = 2, DSBSTATUS_LOOPING = 4;
 constexpr uint16_t WAVE_FORMAT_PCM_ = 1, WAVE_FORMAT_XBOX_ADPCM = 0x69;
 constexpr uint32_t MIXBIN_FRONT_LEFT = 0, MIXBIN_FRONT_RIGHT = 1;
+constexpr uint32_t DS3DMODE_NORMAL = 0, DS3DMODE_HEADRELATIVE = 1, DS3DMODE_DISABLE = 2;
 constexpr int ADPCM_BLOCK_SAMPLES = 64;
 
 struct Voice;
@@ -108,9 +130,12 @@ struct Voice {
     uint16_t tag = WAVE_FORMAT_PCM_, channels = 1, bits = 16, block_align = 2;
     uint32_t rate = 48000, freq = 0;
     int32_t volume = 0;
+    uint32_t headroom = 0;        // attenuation in mB applied before the mix bins
     DSMIXBINVOLUMEPAIR bins[8] = {};
     uint32_t nbins = 0;
     Voice *output = nullptr;      // submix destination
+    bool has3d = false;           // positional voice (SetAllParameters received)
+    DS3DBUFFER p3d = {};
     bool mixin = false;
     std::vector<float> mixin_acc; // stereo frames accumulated this chunk
 
@@ -135,6 +160,7 @@ struct Voice {
 };
 
 std::recursive_mutex g_lock;
+DS3DLISTENER g_listener = {64, {0, 0, 0}, {0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 1, 1, 1};
 std::vector<Voice *> g_voices;
 uint32_t g_dsound_obj[16] = {'DSND'}; // the IDirectSound singleton (contents unused)
 int g_dsound_refs;
@@ -302,24 +328,71 @@ void stream_decode(Voice *v, const uint8_t *src, uint32_t size)
 
 // ---- mixing --------------------------------------------------------------------------
 // Per source channel, gain to the left / right outputs.
+// Stereo gains of a positional voice. On the Xbox, DirectSound turns the 3D
+// parameters into speaker mix-bin volumes; here the source is panned between
+// the two outputs, with distance rolloff when enabled.
+void gains_3d(const Voice *v, float gain, float &gl, float &gr)
+{
+    const DS3DBUFFER &p = v->p3d;
+    float x = p.vPosition.x, y = p.vPosition.y, z = p.vPosition.z;
+    if (p.dwMode == DS3DMODE_NORMAL) {
+        // Into the listener's frame (left-handed: right = top x front).
+        const DS3DLISTENER &l = g_listener;
+        float dx = x - l.vPosition.x, dy = y - l.vPosition.y, dz = z - l.vPosition.z;
+        const D3DVECTOR_ &f = l.vOrientFront, &t = l.vOrientTop;
+        D3DVECTOR_ r = {t.y * f.z - t.z * f.y, t.z * f.x - t.x * f.z, t.x * f.y - t.y * f.x};
+        x = dx * r.x + dy * r.y + dz * r.z;
+        y = dx * t.x + dy * t.y + dz * t.z;
+        z = dx * f.x + dy * f.y + dz * f.z;
+    }
+    float dist = sqrtf(x * x + y * y + z * z);
+    float rolloff = p.flRolloffFactor * g_listener.flRolloffFactor;
+    float mind = p.flMinDistance > 0 ? p.flMinDistance : 1.0f;
+    if (rolloff > 0 && dist > mind) {
+        float d = p.flMaxDistance > mind && dist > p.flMaxDistance ? p.flMaxDistance : dist;
+        gain *= mind / (mind + rolloff * (d - mind));
+    }
+    float pan = dist > 1e-4f ? x / dist : 0.0f;               // sine of the azimuth
+    pan = pan < -1 ? -1 : pan > 1 ? 1 : pan;
+    if (z < 0)
+        gain *= 1.0f + 0.15f * z / (dist > 1e-4f ? dist : 1); // rear sources a little softer
+    // Full level on both sides for a centred source, fading out the far side.
+    gl = gain * std::min(1.0f, sqrtf(1 - pan));
+    gr = gain * std::min(1.0f, sqrtf(1 + pan));
+}
+
 void voice_gains(const Voice *v, int src_channels, float g[2][2])
 {
     g[0][0] = g[0][1] = g[1][0] = g[1][1] = 0.0f;
-    float base = db_gain(v->volume);
+    float base = db_gain(v->volume - int32_t(v->headroom));
+    bool positional = v->has3d && v->p3d.dwMode != DS3DMODE_DISABLE;
+    float speakers = 0.0f; // loudest speaker bin, for positional voices
     for (uint32_t k = 0; k < v->nbins; k++) {
         float gain = base * db_gain(v->bins[k].lVolume);
         int src = src_channels == 1 ? 0 : int(k < uint32_t(src_channels) ? k : src_channels - 1);
         uint32_t bin = v->bins[k].dwMixBin;
-        if (bin >= 6 && bin <= 11)
-            bin -= 6; // crosstalk-cancelled ("XTLK") bins: treat as plain speakers
+        if (bin >= 6 && bin <= 9)
+            bin = bin < 8 ? bin - 6 : bin - 4; // crosstalk-cancelled ("XTLK") speakers
+        if (positional) {
+            if (bin <= 5 && bin != 3)
+                speakers = std::max(speakers, gain);
+            continue;
+        }
         switch (bin) {
         case 0: g[src][0] += gain; break;                       // front left
         case 1: g[src][1] += gain; break;                       // front right
         case 2: g[src][0] += gain * 0.707f; g[src][1] += gain * 0.707f; break; // center
         case 4: g[src][0] += gain * 0.707f; break;              // back left
         case 5: g[src][1] += gain * 0.707f; break;              // back right
-        default: break;                                         // LFE, effect sends
+        default: break;                                         // LFE, I3DL2 and effect sends
         }
+    }
+    if (positional) {
+        float gl, gr;
+        gains_3d(v, speakers, gl, gr);
+        g[0][0] = g[1][0] = gl;
+        g[0][1] = g[1][1] = gr;
+        return;
     }
     if (src_channels == 1) {
         g[1][0] = g[0][0];
@@ -692,7 +765,14 @@ static int32_t __stdcall hle_IDirectSound_CreateSoundBuffer(void *ds, const DSBU
 }
 
 static int32_t __stdcall hle_IDirectSound_SetMixBinHeadroom(void *ds, uint32_t mask, uint32_t headroom) { return DS_OK; }
-static int32_t __stdcall hle_IDirectSound_SetAllParameters(void *ds, const void *listener, uint32_t apply) { return DS_OK; }
+static int32_t __stdcall hle_IDirectSound_SetAllParameters(void *ds, const void *listener, uint32_t apply)
+{
+    if (!listener)
+        return DS_OK;
+    LOCK;
+    g_listener = *static_cast<const DS3DLISTENER *>(listener);
+    return DS_OK;
+}
 static int32_t __stdcall hle_IDirectSound_SetI3DL2Listener(void *ds, const void *listener, uint32_t apply) { return DS_OK; }
 static int32_t __stdcall hle_IDirectSound_CommitDeferredSettings(void *ds) { return DS_OK; }
 static int32_t __stdcall hle_IDirectSound_EnableHeadphones(void *ds, int enable) { return DS_OK; }
@@ -871,7 +951,13 @@ static int32_t __stdcall hle_Buffer_SetVolume(void *b, int32_t vol)
     return DS_OK;
 }
 
-static int32_t __stdcall hle_Buffer_SetHeadroom(void *b, uint32_t hr) { return DS_OK; }
+static int32_t __stdcall hle_Buffer_SetHeadroom(void *b, uint32_t hr)
+{
+    VOICE(b);
+    LOCK;
+    v->headroom = hr;
+    return DS_OK;
+}
 
 static int32_t __stdcall hle_Buffer_SetMixBins(void *b, const DSMIXBINS *mb)
 {
@@ -897,18 +983,33 @@ static int32_t __stdcall hle_Buffer_SetOutputBuffer(void *b, void *target)
     return DS_OK;
 }
 
-static int32_t __stdcall hle_Buffer_SetAllParameters(void *b, const void *p, uint32_t apply) { return DS_OK; }
+static int32_t __stdcall hle_Buffer_SetAllParameters(void *b, const void *p, uint32_t apply)
+{
+    VOICE(b);
+    if (!p)
+        return DS_OK;
+    LOCK;
+    v->p3d = *static_cast<const DS3DBUFFER *>(p);
+    v->has3d = true;
+    return DS_OK;
+}
 static int32_t __stdcall hle_Buffer_SetRolloffCurve(void *b, const float *curve, uint32_t n, uint32_t apply) { return DS_OK; }
 static int32_t __stdcall hle_Buffer_SetI3DL2Source(void *b, const void *p, uint32_t apply) { return DS_OK; }
 
 // ---- streams (non-virtual methods) -------------------------------------------------------------
 static int32_t __stdcall hle_Stream_SetVolume(void *s, int32_t vol) { return hle_Buffer_SetVolume(s, vol); }
-static int32_t __stdcall hle_Stream_SetHeadroom(void *s, uint32_t hr) { return DS_OK; }
+static int32_t __stdcall hle_Stream_SetHeadroom(void *s, uint32_t hr) { return hle_Buffer_SetHeadroom(s, hr); }
 static int32_t __stdcall hle_Stream_SetMixBinVolumes(void *s, const DSMIXBINS *mb) { return hle_Buffer_SetMixBinVolumes(s, mb); }
 static int32_t __stdcall hle_Stream_SetMixBins(void *s, const DSMIXBINS *mb) { return hle_Buffer_SetMixBins(s, mb); }
 static int32_t __stdcall hle_Stream_SetFrequency(void *s, uint32_t f) { return hle_Buffer_SetFrequency(s, f); }
-static int32_t __stdcall hle_Stream_SetAllParameters(void *s, const void *p, uint32_t apply) { return DS_OK; }
-static int32_t __stdcall hle_Stream_SetMode(void *s, uint32_t mode, uint32_t apply) { return DS_OK; }
+static int32_t __stdcall hle_Stream_SetAllParameters(void *s, const void *p, uint32_t apply) { return hle_Buffer_SetAllParameters(s, p, apply); }
+static int32_t __stdcall hle_Stream_SetMode(void *s, uint32_t mode, uint32_t apply)
+{
+    VOICE(s);
+    LOCK;
+    v->p3d.dwMode = mode;
+    return DS_OK;
+}
 static int32_t __stdcall hle_Stream_SetI3DL2Source(void *s, const void *p, uint32_t apply) { return DS_OK; }
 
 static int32_t __stdcall hle_Stream_Pause(void *s, uint32_t pause)

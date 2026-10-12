@@ -5,6 +5,7 @@
 #include "nv2a_internal.h"
 #include "../log.h"
 
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -15,7 +16,21 @@ static std::map<std::pair<unsigned, unsigned>, GLuint> g_fbos;
 static uint64_t g_frame = 1;
 
 uint64_t surface_frame() { return g_frame; }
-void surface_new_frame() { g_frame++; }
+void surface_new_frame()
+{
+    g_frame++;
+    static bool magenta = getenv("SWBF2_DEBUG_MAGENTA") != nullptr;
+    if (magenta)
+        for (Surface *s : g_surfaces)
+            if (!s->depth && s->width == 640) {
+                glBindFramebuffer(GL_FRAMEBUFFER, surface_fbo(s));
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(1, 1, 1, 1);
+                glClearColor(1, 0, 1, 1);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
+}
+
 static uint64_t sparse_hash(const Surface *s)
 {
     uint32_t bpp = s->depth ? (s->format == 1 ? 2 : 4) : ((s->format >= 4 && s->format <= 8) ? 4 : 2);
@@ -35,6 +50,7 @@ void surface_mark_written(Surface *s)
     if (s) {
         s->last_write_frame = g_frame;
         s->mem_sig = sparse_hash(s);
+        s->write_gen++;
     }
 }
 

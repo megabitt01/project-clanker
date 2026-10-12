@@ -16,5 +16,7 @@ void port_set_handlers(PortReadFn read, PortWriteFn write);
 // Installs the vectored exception handler that emulates MMIO accesses and
 // privileged instructions executed by Xbox code.
 void exceptions_init();
+// Debug aid: logs the first CPU write to a physical range (one shot).
+void debug_watch_phys(uint32_t phys, uint32_t size);
 
 } // namespace rt

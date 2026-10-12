@@ -14,6 +14,7 @@ struct Surface {
     unsigned tex = 0;
     uint64_t last_write_frame = 0;
     uint64_t mem_sig = 0;   // sparse hash of guest memory when the GPU last wrote it
+    uint64_t write_gen = 0; // incremented on every GPU write
 };
 
 // Returns (creating if needed) the surface for the current Kelvin surface
@@ -39,5 +40,6 @@ Surface *surface_containing(uint32_t addr, uint32_t &x, uint32_t &y);
 // rendered to it (the GL copy is then stale and is discarded).
 bool surface_is_stale(Surface *s);
 void surface_discard(Surface *s);
+
 
 } // namespace rt

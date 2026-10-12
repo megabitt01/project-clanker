@@ -22,7 +22,8 @@ struct PshState {
     uint8_t two_sided;
     uint8_t flat_shade;
     uint8_t fog_enable;
-    uint8_t pad[3];
+    uint8_t z_cull;       // cull fragments outside the depth range (NV097 CULL_NEAR_FAR without ZCLAMP)
+    uint8_t pad[2];
 };
 
 // Builds a complete fragment shader for the state.

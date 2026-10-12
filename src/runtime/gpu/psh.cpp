@@ -107,6 +107,7 @@ std::string psh_generate(const PshState &s)
     o += "#version 330 core\n";
     o += q + "in vec4 vtx_D0;\n" + q + "in vec4 vtx_D1;\n" + q + "in vec4 vtx_B0;\n" + q + "in vec4 vtx_B1;\n";
     o += "in float vtx_Fog;\nin vec4 vtx_T0;\nin vec4 vtx_T1;\nin vec4 vtx_T2;\nin vec4 vtx_T3;\n";
+    o += "noperspective in float vtx_Zc;\n";
     for (int i = 0; i < 4; i++) {
         snprintf(buf, sizeof buf, "uniform %s tex%d;\n", sampler_type(s.tex_type[i]), i);
         o += buf;
@@ -116,6 +117,11 @@ std::string psh_generate(const PshState &s)
          "uniform float bumpOffset[4];\nuniform float alphaRef;\nuniform vec3 eyeVec;\n"
          "out vec4 fragColor;\n\n"
          "void main() {\n";
+    // Depth range culling is inclusive on the NV2A. GL's own clipping would
+    // drop primitives lying exactly on the far plane, so depth clamping is
+    // always on and the cull happens here.
+    if (s.z_cull)
+        o += "  if (abs(vtx_Zc) > 1.0 + 1e-5) discard;\n";
     if (s.two_sided)
         o += "  vec4 v0 = gl_FrontFacing ? vtx_D0 : vtx_B0;\n  vec4 v1 = gl_FrontFacing ? vtx_D1 : vtx_B1;\n";
     else
@@ -234,8 +240,9 @@ std::string psh_generate(const PshState &s)
     bool mux_msb = (s.control & 0x100) != 0;
     bool unique_c0 = (s.control & 0x1000) != 0, unique_c1 = (s.control & 0x10000) != 0;
     for (uint32_t i = 0; i < stages; i++) {
-        snprintf(buf, sizeof buf, "  { // stage %u\n    vec4 c0 = psConst0[%u];\n    vec4 c1 = psConst1[%u];\n", i,
-                 unique_c0 ? i : 0, unique_c1 ? i : 0);
+        snprintf(buf, sizeof buf,
+                 "  { // stage %u: rgb %08X/%08X alpha %08X/%08X\n    vec4 c0 = psConst0[%u];\n    vec4 c1 = psConst1[%u];\n",
+                 i, s.color_icw[i], s.color_ocw[i], s.alpha_icw[i], s.alpha_ocw[i], unique_c0 ? i : 0, unique_c1 ? i : 0);
         o += buf;
         uint32_t ci = s.color_icw[i], co = s.color_ocw[i], ai = s.alpha_icw[i], ao = s.alpha_ocw[i];
         // RGB portion

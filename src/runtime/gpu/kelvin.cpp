@@ -1,5 +1,6 @@
 // Kelvin 3D engine: method processing.
 #include "kelvin.h"
+#include "capture.h"
 #include "draw.h"
 #include "kelvin_state.h"
 #include "nv2a_internal.h"
@@ -73,6 +74,12 @@ void kelvin_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32
     if (method >= 0x2000)
         return;
     g_hist[method >> 2]++;
+    // Surface/context changes are worth seeing in a frame capture.
+    if (capture_active() && method >= 0x180 && method < 0x220 && kr(method) != parameter) {
+        char b[64];
+        snprintf(b, sizeof b, "method %04X = %08X", method, parameter);
+        capture_draw(b, nullptr);
+    }
     kr(method) = parameter;
 
     // Array-style methods first.
@@ -186,6 +193,7 @@ void kelvin_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32
             set_mask(s, NV_PGRAPH_SURFACE_WRITE_3D, (get_mask(s, NV_PGRAPH_SURFACE_WRITE_3D) + 1) % mod);
         surface_new_frame();
         texture_new_frame();
+        capture_frame_boundary();
         break;
     }
     case NV097_FLIP_STALL: {

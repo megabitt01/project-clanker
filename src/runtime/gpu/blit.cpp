@@ -1,11 +1,13 @@
 // NV2A 2D engine: surfaces 2D (class 0x62), image blit (0x9F) and
 // memory-to-memory format (0x39).
 #include "blit.h"
+#include "capture.h"
 #include "gl.h"
 #include "nv2a_internal.h"
 #include "surface.h"
 #include "../log.h"
 
+#include <cstdio>
 #include <cstring>
 
 namespace rt {
@@ -48,6 +50,12 @@ static void image_blit()
     uint32_t bpp = bpp_for_s2d(fmt);
     if (!w || !h)
         return;
+    if (capture_active()) {
+        char b[160];
+        snprintf(b, sizeof b, "blit %08X(%u,%u) -> %08X(%u,%u) %ux%u fmt=%X pitch=%08X", src, sx, sy, dst, dx, dy, w, h,
+                 fmt, pitch);
+        capture_draw(b, nullptr);
+    }
 
     uint32_t ssx = 0, ssy = 0;
     Surface *ss = surface_containing(src, ssx, ssy);
@@ -93,6 +101,11 @@ static void m2mf_copy()
     uint32_t src = in.address + g_m2mf[0x30C >> 2], dst = out.address + g_m2mf[0x310 >> 2];
     int32_t pin = int32_t(g_m2mf[0x314 >> 2]), pout = int32_t(g_m2mf[0x318 >> 2]);
     uint32_t len = g_m2mf[0x31C >> 2], lines = g_m2mf[0x320 >> 2];
+    if (capture_active()) {
+        char b[160];
+        snprintf(b, sizeof b, "m2mf %08X -> %08X %ux%u", src, dst, len, lines);
+        capture_draw(b, nullptr);
+    }
     for (uint32_t l = 0; l < lines; l++) {
         uint32_t s = src + l * pin, d = dst + l * pout;
         if (s + len > XBOX_RAM_SIZE || d + len > XBOX_RAM_SIZE)

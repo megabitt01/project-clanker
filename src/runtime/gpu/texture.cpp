@@ -4,9 +4,12 @@
 #include "kelvin.h"
 #include "kelvin_state.h"
 #include "nv2a_internal.h"
+#include "capture.h"
+#include "renderer.h"
 #include "surface.h"
 #include "../log.h"
 
+#include <cstdio>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -194,6 +197,23 @@ void upload_level(GLenum target, uint32_t level, uint32_t fmt, const FormatInfo 
     glTexImage2D(target, level, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, scratch.data());
 }
 
+// One mip level of a swizzled volume texture.
+void upload_level_3d(uint32_t level, uint32_t fmt, const FormatInfo &fi, const uint8_t *src, uint32_t w, uint32_t h,
+                     uint32_t d, const uint32_t *palette, std::vector<uint32_t> &scratch)
+{
+    scratch.resize(size_t(w) * h * d);
+    static std::vector<uint32_t> xo, yo, zo;
+    xo.resize(w);
+    yo.resize(h);
+    zo.resize(d);
+    swizzle_tables_3d(w, h, d, xo.data(), yo.data(), zo.data());
+    for (uint32_t z = 0; z < d; z++)
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++)
+                scratch[(size_t(z) * h + y) * w + x] = decode_texel(fmt, src + (xo[x] | yo[y] | zo[z]) * fi.bpp, palette);
+    glTexImage3D(GL_TEXTURE_3D, level, GL_RGBA8, w, h, d, 0, GL_RGBA, GL_UNSIGNED_BYTE, scratch.data());
+}
+
 GLenum wrap_mode(uint32_t m)
 {
     switch (m) {
@@ -231,15 +251,178 @@ void apply_sampler(GLenum target, int stage, uint32_t levels)
     glTexParameterf(target, GL_TEXTURE_LOD_BIAS, bias / 256.0f);
 }
 
+#ifndef GL_DEPTH_STENCIL_TEXTURE_MODE
+#define GL_DEPTH_STENCIL_TEXTURE_MODE 0x90EA
+#endif
+
+// A depth/stencil surface sampled with a colour format: the shader expects
+// the raw bytes of guest memory (Z24S8 is stencil in byte 0 and depth in
+// bytes 1-3; Z16 is depth in bytes 0-1). The surface lives in a GL depth
+// texture, so it is converted on the GPU into an RGBA8 texture holding those
+// bytes in memory order, which is then swizzled for the requested format.
+struct DepthView {
+    GLuint tex = 0, fbo = 0;
+    uint32_t w = 0, h = 0;
+    uint64_t gen = ~0ull;
+};
+std::unordered_map<GLuint, DepthView> g_depth_views;
+bool g_bindings_disturbed;
+GLuint g_conv_prog, g_conv_vao;
+GLint g_conv_mode, g_conv_depth, g_conv_stencil;
+
+void init_depth_conversion()
+{
+    static const char *vs = R"(#version 330 core
+void main() {
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+})";
+    static const char *fs = R"(#version 330 core
+uniform sampler2D depthTex;
+uniform usampler2D stencilTex;
+uniform int mode;   // 0 = Z24S8 depth bytes, 1 = Z24S8 stencil byte, 2 = Z16
+out vec4 color;
+void main() {
+    ivec2 c = ivec2(gl_FragCoord.xy);
+    if (mode == 1) {
+        color = vec4(float(texelFetch(stencilTex, c, 0).r) / 255.0, 0.0, 0.0, 0.0);
+        return;
+    }
+    float d = texelFetch(depthTex, c, 0).r;
+    if (mode == 0) {
+        uint z = min(uint(clamp(d, 0.0, 1.0) * 16777215.0 + 0.5), 16777215u);
+        color = vec4(0.0, float(z & 255u), float((z >> 8) & 255u), float(z >> 16)) / 255.0;
+    } else {
+        uint z = min(uint(clamp(d, 0.0, 1.0) * 65535.0 + 0.5), 65535u);
+        color = vec4(float(z & 255u), float(z >> 8), 0.0, 0.0) / 255.0;
+    }
+})";
+    g_conv_prog = renderer_compile_program(vs, fs, "depth-to-color");
+    g_conv_mode = glGetUniformLocation(g_conv_prog, "mode");
+    g_conv_depth = glGetUniformLocation(g_conv_prog, "depthTex");
+    g_conv_stencil = glGetUniformLocation(g_conv_prog, "stencilTex");
+    glGenVertexArrays(1, &g_conv_vao);
+}
+
+// Returns an RGBA8 texture with the surface's bytes in memory order. Changes
+// the bound framebuffer, program, VAO, texture units 0-1 and raster state, so
+// it must run before the draw sets those up.
+GLuint depth_as_color(Surface *s)
+{
+    if (!g_conv_prog)
+        init_depth_conversion();
+    DepthView &v = g_depth_views[s->tex];
+    if (!v.tex || v.w != s->width || v.h != s->height) {
+        if (!v.tex) {
+            glGenTextures(1, &v.tex);
+            glGenFramebuffers(1, &v.fbo);
+        }
+        glBindTexture(GL_TEXTURE_2D, v.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s->width, s->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, v.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, v.tex, 0);
+        v.w = s->width;
+        v.h = s->height;
+        v.gen = ~0ull;
+    }
+    if (v.gen == s->write_gen)
+        return v.tex;
+    v.gen = s->write_gen;
+    g_bindings_disturbed = true;
+    glBindFramebuffer(GL_FRAMEBUFFER, v.fbo);
+    glViewport(0, 0, v.w, v.h);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glUseProgram(g_conv_prog);
+    glBindVertexArray(g_conv_vao);
+    glUniform1i(g_conv_depth, 0);
+    glUniform1i(g_conv_stencil, 1);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s->tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+    if (s->format == 1) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glUniform1i(g_conv_mode, 2);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    } else {
+        glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_DEPTH_COMPONENT);
+        glColorMask(GL_FALSE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glUniform1i(g_conv_mode, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        // Stencil: a second pass through the same texture in stencil mode.
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, s->tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_STENCIL_INDEX);
+        glColorMask(GL_TRUE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glUniform1i(g_conv_mode, 1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glTexParameteri(GL_TEXTURE_2D, GL_DEPTH_STENCIL_TEXTURE_MODE, GL_DEPTH_COMPONENT);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+    }
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (capture_active()) {
+        std::vector<uint8_t> px(size_t(v.w) * v.h * 4);
+        glReadPixels(0, 0, v.w, v.h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        char b[96];
+        snprintf(b, sizeof b, "depth view %08X: centre %02X%02X%02X%02X corner %02X%02X%02X%02X", s->addr,
+                 px[(v.h / 2 * v.w + v.w / 2) * 4], px[(v.h / 2 * v.w + v.w / 2) * 4 + 1],
+                 px[(v.h / 2 * v.w + v.w / 2) * 4 + 2], px[(v.h / 2 * v.w + v.w / 2) * 4 + 3], px[(40 * v.w + 100) * 4],
+                 px[(40 * v.w + 100) * 4 + 1], px[(40 * v.w + 100) * 4 + 2], px[(40 * v.w + 100) * 4 + 3]);
+        capture_draw(b, nullptr);
+    }
+    return v.tex;
+}
+
+// Swizzle mapping memory-order bytes (R = byte 0 ... A = byte 3) to the
+// channels a 32-bit colour format reads (see decode_texel).
+bool raw_swizzle(uint32_t fmt, GLint *sw)
+{
+    switch (fmt) {
+    case 0x06: case 0x07: case 0x12: case 0x1E:   // A8R8G8B8 / X8R8G8B8
+        sw[0] = GL_BLUE; sw[1] = GL_GREEN; sw[2] = GL_RED;
+        sw[3] = (fmt == 0x07 || fmt == 0x1E) ? GL_ONE : GL_ALPHA;
+        return true;
+    case 0x3A: case 0x3F:                         // A8B8G8R8
+        sw[0] = GL_RED; sw[1] = GL_GREEN; sw[2] = GL_BLUE; sw[3] = GL_ALPHA;
+        return true;
+    case 0x3B: case 0x40:                         // B8G8R8A8
+        sw[0] = GL_GREEN; sw[1] = GL_BLUE; sw[2] = GL_ALPHA; sw[3] = GL_RED;
+        return true;
+    case 0x3C: case 0x41:                         // R8G8B8A8
+        sw[0] = GL_ALPHA; sw[1] = GL_BLUE; sw[2] = GL_GREEN; sw[3] = GL_RED;
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // namespace
 
 void swizzle_tables(uint32_t w, uint32_t h, uint32_t *xoff, uint32_t *yoff)
 {
-    uint32_t mx = 0, my = 0, bit = 1, mbit = 1;
+    swizzle_tables_3d(w, h, 1, xoff, yoff, nullptr);
+}
+
+void swizzle_tables_3d(uint32_t w, uint32_t h, uint32_t d, uint32_t *xoff, uint32_t *yoff, uint32_t *zoff)
+{
+    uint32_t mx = 0, my = 0, mz = 0, bit = 1, mbit = 1;
     for (;;) {
         bool done = true;
         if (bit < w) { mx |= mbit; mbit <<= 1; done = false; }
         if (bit < h) { my |= mbit; mbit <<= 1; done = false; }
+        if (bit < d) { mz |= mbit; mbit <<= 1; done = false; }
         bit <<= 1;
         if (done) break;
     }
@@ -257,9 +440,18 @@ void swizzle_tables(uint32_t w, uint32_t h, uint32_t *xoff, uint32_t *yoff)
     };
     for (uint32_t x = 0; x < w; x++) xoff[x] = fill(mx, x);
     for (uint32_t y = 0; y < h; y++) yoff[y] = fill(my, y);
+    if (zoff)
+        for (uint32_t z = 0; z < d; z++) zoff[z] = fill(mz, z);
 }
 
 void texture_new_frame() { g_tex_frame++; }
+
+bool texture_take_disturbed()
+{
+    bool d = g_bindings_disturbed;
+    g_bindings_disturbed = false;
+    return d;
+}
 
 TextureBinding texture_bind_stage(int stage)
 {
@@ -282,6 +474,8 @@ TextureBinding texture_bind_stage(int stage)
     uint32_t levels = (format >> 16) & 0xF;
     if (!levels) levels = 1;
     uint32_t w = 1u << ((format >> 20) & 0xF), h = 1u << ((format >> 24) & 0xF);
+    bool volume = dims == 3 && !cube;
+    uint32_t d = volume ? 1u << ((format >> 28) & 0xF) : 1;
     FormatInfo fi = format_info(fmt);
     uint32_t pitch = 0, rect = 0;
     if (fi.linear) {
@@ -308,6 +502,19 @@ TextureBinding texture_bind_stage(int stage)
         return b;
     }
     if (Surface *s = surface_find(addr, true)) {
+        GLint sw[4];
+        if (!s->swizzled && raw_swizzle(fmt, sw)) {
+            GLuint t = depth_as_color(s);
+            glActiveTexture(GL_TEXTURE0 + stage);
+            glBindTexture(GL_TEXTURE_2D, t);
+            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, sw);
+            apply_sampler(GL_TEXTURE_2D, stage, 1);
+            b.tex = t;
+            b.target = GL_TEXTURE_2D;
+            b.type = fi.linear ? PSH_TEX_RECT : PSH_TEX_2D;
+            if (fi.linear) { b.scale_x = 1.0f / s->width; b.scale_y = 1.0f / s->height; }
+            return b;
+        }
         b.tex = s->tex;
         b.target = GL_TEXTURE_2D;
         b.type = fi.linear ? PSH_TEX_RECT : PSH_TEX_2D;
@@ -327,13 +534,20 @@ TextureBinding texture_bind_stage(int stage)
         glBindTexture(GL_TEXTURE_2D, 0);
         return b;
     }
+    if (volume && (fi.kind != K_RGBA8 || !fi.swizzled)) {
+        if (g_unknown_logged.insert(0x100 | fmt).second)
+            LOG_WARN("texture", "unsupported volume texture format 0x%02X", fmt);
+        glBindTexture(GL_TEXTURE_3D, 0);
+        return b;
+    }
 
     // Total size of the image data (all faces and levels).
     uint32_t face_size = 0;
-    for (uint32_t l = 0, lw = w, lh = h; l < levels; l++) {
-        face_size += fi.linear ? pitch * lh : level_size(fi, lw, lh);
+    for (uint32_t l = 0, lw = w, lh = h, ld = d; l < levels; l++) {
+        face_size += fi.linear ? pitch * lh : level_size(fi, lw, lh) * ld;
         lw = lw > 1 ? lw / 2 : 1;
         lh = lh > 1 ? lh / 2 : 1;
+        ld = ld > 1 ? ld / 2 : 1;
     }
     if (cube)
         face_size = (face_size + 127) & ~127u;
@@ -354,7 +568,7 @@ TextureBinding texture_bind_stage(int stage)
 
     Key key{addr, format, rect, pitch, pal_word};
     CachedTexture &ct = g_cache[key];
-    GLenum target = cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+    GLenum target = cube ? GL_TEXTURE_CUBE_MAP : volume ? GL_TEXTURE_3D : GL_TEXTURE_2D;
     bool need_upload = ct.tex == 0;
     if (ct.checked_frame != g_tex_frame) {
         uint64_t hsh = hash_bytes(src, total);
@@ -374,7 +588,17 @@ TextureBinding texture_bind_stage(int stage)
         static std::vector<uint32_t> scratch;
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, levels - 1);
-        for (uint32_t face = 0; face < (cube ? 6u : 1u); face++) {
+        if (volume) {
+            const uint8_t *p = src;
+            for (uint32_t l = 0, lw = w, lh = h, ld = d; l < levels; l++) {
+                upload_level_3d(l, fmt, fi, p, lw, lh, ld, palette, scratch);
+                p += level_size(fi, lw, lh) * ld;
+                lw = lw > 1 ? lw / 2 : 1;
+                lh = lh > 1 ? lh / 2 : 1;
+                ld = ld > 1 ? ld / 2 : 1;
+            }
+        }
+        for (uint32_t face = 0; !volume && face < (cube ? 6u : 1u); face++) {
             const uint8_t *p = src + face * face_size;
             GLenum t = cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + face : GL_TEXTURE_2D;
             for (uint32_t l = 0, lw = w, lh = h; l < levels; l++) {
@@ -388,12 +612,11 @@ TextureBinding texture_bind_stage(int stage)
     apply_sampler(target, stage, levels);
     b.tex = ct.tex;
     b.target = target;
-    b.type = cube ? PSH_TEX_CUBE : (fi.linear ? PSH_TEX_RECT : PSH_TEX_2D);
+    b.type = cube ? PSH_TEX_CUBE : volume ? PSH_TEX_3D : (fi.linear ? PSH_TEX_RECT : PSH_TEX_2D);
     if (fi.linear) {
         b.scale_x = 1.0f / w;
         b.scale_y = 1.0f / h;
     }
-    (void)dims;
     return b;
 }
 

@@ -8,6 +8,7 @@
 #include "mmio.h"
 #include "log.h"
 #include "crash.h"
+#include "memory.h"
 
 #include <windows.h>
 #include <vector>
@@ -395,6 +396,45 @@ static bool emulate_privileged(CONTEXT *c)
     return false;
 }
 
+// Debug write watch on a physical range (see debug_watch_phys).
+static uint32_t g_watch_lo, g_watch_hi;
+static volatile LONG g_watch_armed;
+
+static void watch_protect(DWORD prot)
+{
+    DWORD old;
+    for (uint32_t base : {XBOX_PHYS_BASE, XBOX_PHYS_WC_BASE})
+        VirtualProtect(reinterpret_cast<void *>(uintptr_t(base + g_watch_lo)), g_watch_hi - g_watch_lo, prot, &old);
+}
+
+void debug_watch_phys(uint32_t phys, uint32_t size)
+{
+    g_watch_lo = phys & ~0xFFFu;
+    g_watch_hi = (phys + size + 0xFFF) & ~0xFFFu;
+    InterlockedExchange(&g_watch_armed, 1);
+    watch_protect(PAGE_READONLY);
+    LOG_INFO("watch", "watching writes to physical %08X-%08X", g_watch_lo, g_watch_hi);
+}
+
+static bool watch_hit(CONTEXT *c, uint32_t addr)
+{
+    if (!g_watch_armed)
+        return false;
+    uint32_t phys = addr >= XBOX_PHYS_WC_BASE ? addr - XBOX_PHYS_WC_BASE : addr - XBOX_PHYS_BASE;
+    if (addr < XBOX_PHYS_BASE || phys < g_watch_lo || phys >= g_watch_hi)
+        return false;
+    if (InterlockedExchange(&g_watch_armed, 0)) {
+        watch_protect(PAGE_EXECUTE_READWRITE);
+        LOG_INFO("watch", "first write to %08X (phys %08X) from %08X %s, thread %lu", addr, phys, c->Eip,
+                 symbolize(c->Eip).c_str(), GetCurrentThreadId());
+        const uint32_t *sp = reinterpret_cast<const uint32_t *>(uintptr_t(c->Esp));
+        for (int i = 0; i < 48; i++)
+            if (sp[i] >= 0x11000 && sp[i] < 0x00D80000)
+                LOG_INFO("watch", "  [esp+%02X] %08X %s", i * 4, sp[i], symbolize(sp[i]).c_str());
+    }
+    return true;
+}
+
 static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep)
 {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
@@ -402,6 +442,8 @@ static LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep)
     switch (er->ExceptionCode) {
     case EXCEPTION_ACCESS_VIOLATION: {
         uint32_t addr = uint32_t(er->ExceptionInformation[1]);
+        if (er->ExceptionInformation[0] == 1 && watch_hit(c, addr))
+            return EXCEPTION_CONTINUE_EXECUTION;
         if (find_region(addr) && emulate_mmio(c, addr))
             return EXCEPTION_CONTINUE_EXECUTION;
         break;

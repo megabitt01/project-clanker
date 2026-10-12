@@ -1,5 +1,6 @@
 // Draw submission: turns a Kelvin BEGIN/END batch into OpenGL draws.
 #include "draw.h"
+#include "capture.h"
 #include "gl.h"
 #include "kelvin.h"
 #include "kelvin_state.h"
@@ -24,6 +25,8 @@ GLuint g_vao, g_vbo, g_ibo;
 
 struct Program {
     GLuint prog = 0;
+    uint64_t key = 0;
+    std::string vs, fs;
     GLint c, surfaceInfo, fogInfo, psConst0, psConst1, finalConst0, finalConst1, fogColor, texScale, bumpMat,
         bumpScale, bumpOffset, alphaRef, eyeVec, compositeMat, texMat, texMatEnable;
 };
@@ -60,6 +63,7 @@ std::string vs_header(bool flat)
          "uniform mat4 compositeMat;\nuniform mat4 texMat[4];\nuniform int texMatEnable[4];\n";
     s += q + "out vec4 vtx_D0;\n" + q + "out vec4 vtx_D1;\n" + q + "out vec4 vtx_B0;\n" + q + "out vec4 vtx_B1;\n";
     s += "out float vtx_Fog;\nout vec4 vtx_T0;\nout vec4 vtx_T1;\nout vec4 vtx_T2;\nout vec4 vtx_T3;\n";
+    s += "noperspective out float vtx_Zc;\n";
     s += k_vs_helpers;
     s += "void main() {\n"
          "  vec4 R0 = vec4(0.0), R1 = vec4(0.0), R2 = vec4(0.0), R3 = vec4(0.0), R4 = vec4(0.0), R5 = vec4(0.0);\n"
@@ -82,6 +86,7 @@ const char *k_vs_epilogue = R"(
   oPos.y = oPos.y * (2.0 / surfaceInfo.y) - 1.0;
   if (surfaceInfo.w != surfaceInfo.z)
     oPos.z = (oPos.z - surfaceInfo.z) / (0.5 * (surfaceInfo.w - surfaceInfo.z)) - 1.0;
+  vtx_Zc = oPos.z;
   if (oPos.w < 0.0) oPos.w = clamp(oPos.w, -1.84467e+19, -5.42101e-20);
   else oPos.w = clamp(oPos.w, 5.42101e-20, 1.84467e+19);
   oPos.xyz *= oPos.w;
@@ -149,8 +154,10 @@ Program &get_program(const PshState &ps, bool programmable, bool flat)
     uint64_t vs_key = programmable ? vs_program_hash() : 0x1234567ull;
     uint64_t key = fnv(&ps, sizeof ps, vs_key ^ (flat ? 0x55 : 0));
     auto it = g_programs.find(key);
-    if (it != g_programs.end())
+    if (it != g_programs.end()) {
+        capture_program(key, it->second.vs, it->second.fs);
         return it->second;
+    }
     std::string vs = vs_header(flat);
     if (programmable)
         vs += vsh_translate(g_kd.program, g_kd.program_start, NV2A_MAX_TRANSFORM_PROGRAM_LENGTH, nullptr);
@@ -180,6 +187,10 @@ Program &get_program(const PshState &ps, bool programmable, bool flat)
     p.compositeMat = loc(p.prog, "compositeMat");
     p.texMat = loc(p.prog, "texMat");
     p.texMatEnable = loc(p.prog, "texMatEnable");
+    p.key = key;
+    p.vs = vs;
+    p.fs = fs;
+    capture_program(key, vs, fs);
     LOG_DEBUG("draw", "compiled program %016llX (%s, %zu programs)", (unsigned long long)key,
               programmable ? "vertex program" : "fixed function", g_programs.size() + 1);
     return g_programs.emplace(key, p).first->second;
@@ -266,15 +277,22 @@ void apply_state(Surface *color, Surface *zeta)
         glDisable(GL_BLEND);
     }
     // Depth
+    // As in D3D, the depth buffer is only written while the depth test is
+    // enabled; a depth mask alone does not write it.
     bool depth_test = kr(NV097_SET_DEPTH_TEST_ENABLE) != 0 && zeta;
-    bool depth_write = kr(NV097_SET_DEPTH_MASK) != 0 && zeta;
-    if (depth_test || depth_write) {
+    bool depth_write = kr(NV097_SET_DEPTH_MASK) != 0 && depth_test;
+    if (depth_test) {
         glEnable(GL_DEPTH_TEST);
-        glDepthFunc(depth_test ? kr(NV097_SET_DEPTH_FUNC) : GL_ALWAYS);
+        glDepthFunc(kr(NV097_SET_DEPTH_FUNC));
     } else {
         glDisable(GL_DEPTH_TEST);
     }
     glDepthMask(depth_write ? GL_TRUE : GL_FALSE);
+    // Near/far handling: without CULL_NEAR_FAR the NV2A neither clips nor
+    // culls against the depth range, and ZCLAMP clamps depth into it.
+    // Depth range: GL clipping is replaced by clamping, and culling against
+    // the range (when enabled) is done per fragment, see psh.cpp.
+    glEnable(GL_DEPTH_CLAMP);
     // Stencil
     if (kr(NV097_SET_STENCIL_TEST_ENABLE) && zeta && zeta->format == 2) {
         glEnable(GL_STENCIL_TEST);
@@ -316,6 +334,8 @@ void apply_state(Surface *color, Surface *zeta)
         glDisable(GL_SCISSOR_TEST);
     }
     glEnable(GL_PROGRAM_POINT_SIZE);
+    static bool noz = getenv("SWBF2_DEBUG_NOZ") != nullptr;
+    if (noz) { glEnable(GL_DEPTH_CLAMP); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); }
 }
 
 struct AttrInfo {
@@ -476,6 +496,94 @@ void draw_indexed(uint32_t prim, const std::vector<uint32_t> &indices, uint32_t 
     glDrawElements(gl_mode(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, nullptr);
 }
 
+std::string describe_draw(const Program &p, uint32_t prim, Surface *color, Surface *zeta, const AttrInfo *attrs)
+{
+    char b[512];
+    std::string d;
+    size_t verts = g_kd.inline_elements.size() + g_kd.immediate.size() / 64;
+    for (size_t i = 1; i < g_kd.draw_arrays.size(); i += 2)
+        verts += g_kd.draw_arrays[i];
+    snprintf(b, sizeof b, "prim=%u n=%zu%s%s prog=%016llX %s color=%08X/%u %ux%u zeta=%08X", prim, verts,
+             g_kd.inline_array.empty() ? "" : " inline", g_kd.immediate.empty() ? "" : " imm",
+             (unsigned long long)p.key, vertex_program_mode() ? "vp" : "ff", color ? color->addr : 0,
+             color ? color->format : 0, color ? color->width : 0, color ? color->height : 0, zeta ? zeta->addr : 0);
+    d += b;
+    for (int i = 0; i < 4; i++) {
+        uint32_t c0 = kr(NV097_SET_TEXTURE_CONTROL0 + i * 0x40);
+        if (!(c0 & 0x40000000))
+            continue;
+        snprintf(b, sizeof b, " t%d=%08X/fmt%08X/addr%08X/filt%08X", i, kr(NV097_SET_TEXTURE_OFFSET + i * 0x40),
+                 kr(NV097_SET_TEXTURE_FORMAT + i * 0x40), kr(NV097_SET_TEXTURE_ADDRESS + i * 0x40),
+                 kr(NV097_SET_TEXTURE_FILTER + i * 0x40));
+        d += b;
+    }
+    if (kr(NV097_SET_BLEND_ENABLE)) {
+        snprintf(b, sizeof b, " blend=%X/%X/%X", kr(NV097_SET_BLEND_FUNC_SFACTOR), kr(NV097_SET_BLEND_FUNC_DFACTOR),
+                 kr(NV097_SET_BLEND_EQUATION));
+        d += b;
+    }
+    snprintf(b, sizeof b, " z=%u/%u/%X zc=%X cmask=%08X", kr(NV097_SET_DEPTH_TEST_ENABLE), kr(NV097_SET_DEPTH_MASK),
+             kr(NV097_SET_DEPTH_FUNC), kr(NV097_SET_ZMIN_MAX_CONTROL), kr(NV097_SET_COLOR_MASK));
+    d += b;
+    if (kr(NV097_SET_ALPHA_TEST_ENABLE)) {
+        snprintf(b, sizeof b, " atest=%X/%02X", kr(NV097_SET_ALPHA_FUNC), kr(NV097_SET_ALPHA_REF));
+        d += b;
+    }
+    if (kr(NV097_SET_FOG_ENABLE)) {
+        snprintf(b, sizeof b, " fog=%X/%X/%08X/%g,%g", kr(NV097_SET_FOG_MODE), kr(NV097_SET_FOG_GEN_MODE),
+                 kr(NV097_SET_FOG_COLOR), kf(NV097_SET_FOG_PARAMS), kf(NV097_SET_FOG_PARAMS + 4));
+        d += b;
+    }
+    if (kr(NV097_SET_STENCIL_TEST_ENABLE)) {
+        snprintf(b, sizeof b, " stencil=%X/%X/%X", kr(NV097_SET_STENCIL_FUNC), kr(NV097_SET_STENCIL_FUNC_REF),
+                 kr(NV097_SET_STENCIL_OP_ZPASS));
+        d += b;
+    }
+    uint32_t stages = kr(NV097_SET_COMBINER_CONTROL) & 0xFF;
+    snprintf(b, sizeof b, " comb=%X", kr(NV097_SET_COMBINER_CONTROL));
+    d += b;
+    for (uint32_t i = 0; i < stages && i < 8; i++) {
+        snprintf(b, sizeof b, " k%u=%08X,%08X", i, kr(NV097_SET_COMBINER_FACTOR0 + 4 * i), kr(NV097_SET_COMBINER_FACTOR1 + 4 * i));
+        d += b;
+    }
+    snprintf(b, sizeof b, " kf=%08X,%08X", kr(NV097_SET_SPECULAR_FOG_FACTOR), kr(NV097_SET_SPECULAR_FOG_FACTOR + 4));
+    d += b;
+    if (verts <= 4) {
+        static const int cs[] = {0, 2, 3, 15, 16, 17, 41, 42, 43, 44, 45};
+        for (int ci : cs) {
+            snprintf(b, sizeof b, " c%d=(%g,%g,%g,%g)", ci, g_kd.constants[ci][0], g_kd.constants[ci][1],
+                     g_kd.constants[ci][2], g_kd.constants[ci][3]);
+            d += b;
+        }
+        if (!g_kd.draw_arrays.empty() && attrs[0].enabled && attrs[0].type == NV097_VTX_TYPE_F) {
+            d += " mem0=";
+            for (uint32_t v = 0; v < 4; v++) {
+                const float *f = reinterpret_cast<const float *>(phys_ptr(attrs[0].addr + (g_kd.draw_arrays[0] + v) * attrs[0].stride));
+                snprintf(b, sizeof b, "(%g,%g)", f[0], f[1]);
+                d += b;
+            }
+            snprintf(b, sizeof b, "@%08X", attrs[0].addr);
+            d += b;
+        }
+        if (!g_kd.inline_array.empty() || !g_kd.draw_arrays.empty()) {
+            d += " v0=";
+            for (size_t i = 0; i < g_kd.inline_array.size() && i < 16; i++) {
+                float f;
+                memcpy(&f, &g_kd.inline_array[i], 4);
+                snprintf(b, sizeof b, "%g,", f);
+                d += b;
+            }
+        }
+    }
+    d += " attrs=";
+    for (int i = 0; i < 16; i++)
+        if (attrs[i].enabled) {
+            snprintf(b, sizeof b, "%d:%u.%u/%u ", i, attrs[i].type, attrs[i].count, attrs[i].stride);
+            d += b;
+        }
+    return d;
+}
+
 } // namespace
 
 void draw_init()
@@ -495,6 +603,7 @@ void draw_init()
 
 void draw_query_begin();
 void draw_query_end();
+static GLuint g_active_query;
 
 void draw_flush()
 {
@@ -505,19 +614,27 @@ void draw_flush()
         return;
     Surface *color = surface_color_current();
     Surface *zeta = surface_zeta_current();
-    if (!surface_bind(color, zeta))
-        return;
-    Surface *s = color ? color : zeta;
-    glBindVertexArray(g_vao);
-    apply_state(color, zeta);
-
+    // Textures first: binding one can involve GPU work (surface conversion)
+    // that changes the framebuffer and raster state set up below.
     TextureBinding tb[4];
     PshState ps;
     memset(&ps, 0, sizeof ps);
-    for (int i = 0; i < 4; i++) {
-        tb[i] = texture_bind_stage(i);
-        ps.tex_type[i] = tb[i].type;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < 4; i++)
+            tb[i] = texture_bind_stage(i);
+        if (!texture_take_disturbed())
+            break;
     }
+    for (int i = 0; i < 4; i++)
+        ps.tex_type[i] = tb[i].type;
+    if (!surface_bind(color, zeta)) {
+        if (capture_active())
+            capture_draw("DROPPED draw: no surface bound", nullptr);
+        return;
+    }
+    Surface *s = color ? color : zeta;
+    glBindVertexArray(g_vao);
+    apply_state(color, zeta);
     for (int i = 0; i < 8; i++) {
         ps.color_icw[i] = kr(NV097_SET_COMBINER_COLOR_ICW + 4 * i);
         ps.color_ocw[i] = kr(NV097_SET_COMBINER_COLOR_OCW + 4 * i);
@@ -534,6 +651,8 @@ void draw_flush()
     ps.two_sided = kr(NV097_SET_TWO_SIDE_LIGHT_EN) != 0;
     ps.flat_shade = kr(NV097_SET_SHADE_MODE) == 0x1D00;
     ps.fog_enable = kr(NV097_SET_FOG_ENABLE) != 0;
+    uint32_t zc = kr(NV097_SET_ZMIN_MAX_CONTROL);
+    ps.z_cull = (zc & 1) && !(zc & 0x10);
 
     bool programmable = vertex_program_mode();
     Program &p = get_program(ps, programmable, ps.flat_shade != 0);
@@ -543,12 +662,21 @@ void draw_flush()
     AttrInfo attrs[16];
     decode_attrs(attrs);
     draw_query_begin();
+    static GLuint cov_query;
+    bool cov = capture_active() && !g_active_query;
+    if (cov) {
+        if (!cov_query)
+            glGenQueries(1, &cov_query);
+        glBeginQuery(GL_SAMPLES_PASSED, cov_query);
+    }
 
     if (!g_kd.inline_elements.empty()) {
         auto mm = std::minmax_element(g_kd.inline_elements.begin(), g_kd.inline_elements.end());
         uint32_t lo = *mm.first, hi = *mm.second;
         if (hi - lo < 0x100000 && setup_array_attrs(attrs, lo, hi))
             draw_indexed(prim, g_kd.inline_elements, lo);
+        else if (capture_active())
+            capture_draw("DROPPED indexed draw", nullptr);
     }
     if (!g_kd.draw_arrays.empty()) {
         uint32_t lo = 0xFFFFFFFF, hi = 0;
@@ -559,6 +687,8 @@ void draw_flush()
         if (hi - lo < 0x100000 && setup_array_attrs(attrs, lo, hi))
             for (size_t i = 0; i < g_kd.draw_arrays.size(); i += 2)
                 draw_range(prim, g_kd.draw_arrays[i] - lo, g_kd.draw_arrays[i + 1]);
+        else if (capture_active())
+            capture_draw("DROPPED array draw", nullptr);
     }
     if (!g_kd.inline_array.empty()) {
         // Inline vertices: enabled attributes packed in slot order, each
@@ -596,7 +726,14 @@ void draw_flush()
         }
         draw_range(prim, 0, uint32_t(g_kd.immediate.size() / 64));
     }
+    GLuint cov_samples = 0;
+    if (cov) {
+        glEndQuery(GL_SAMPLES_PASSED);
+        glGetQueryObjectuiv(cov_query, GL_QUERY_RESULT, &cov_samples);
+    }
     draw_query_end();
+    if (capture_active())
+        capture_draw(describe_draw(p, prim, color, zeta, attrs) + " samples=" + std::to_string(cov_samples), color);
     surface_mark_written(color);
     surface_mark_written(zeta);
     g_nv->draw_calls++;
@@ -604,7 +741,6 @@ void draw_flush()
 
 // ---- occlusion reports (NV097 ZPASS pixel count) ------------------------------
 static std::vector<GLuint> g_queries, g_free_queries;
-static GLuint g_active_query;
 static uint32_t g_zpass_total;
 
 static void collect_queries()
@@ -643,6 +779,8 @@ void draw_query_end()
 
 void draw_report_clear()
 {
+    if (capture_active())
+        capture_draw("report clear", nullptr);
     collect_queries();
     g_zpass_total = 0;
 }
@@ -660,6 +798,11 @@ void draw_report_write(uint32_t parameter)
     memcpy(p, &timestamp, 8);
     memcpy(p + 8, &g_zpass_total, 4);
     memcpy(p + 12, &done, 4);
+    if (capture_active()) {
+        char b[96];
+        snprintf(b, sizeof b, "report %08X = %u", parameter, g_zpass_total);
+        capture_draw(b, nullptr);
+    }
 }
 
 void draw_clear(uint32_t flags)
@@ -696,6 +839,13 @@ void draw_clear(uint32_t flags)
         else
             glClearBufferfv(GL_DEPTH, 0, &depth);
         surface_mark_written(zeta);
+    }
+    if (capture_active()) {
+        char b[160];
+        snprintf(b, sizeof b, "clear flags=%X rect=%08X,%08X surf=%08X/%08X color=%08X z=%08X", flags, xr, yr,
+                 color ? color->addr : 0, zeta ? zeta->addr : 0, kr(NV097_SET_COLOR_CLEAR_VALUE),
+                 kr(NV097_SET_ZSTENCIL_CLEAR_VALUE));
+        capture_draw(b, color);
     }
     glDisable(GL_SCISSOR_TEST);
 }

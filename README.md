@@ -95,6 +95,8 @@ Alt+Enter toggles fullscreen.
 | `--debug`, `--trace` | verbose logging to `swbf2.log` |
 | `--shots` | write a PNG screenshot every 3 s (interval: `SWBF2_SHOT_INTERVAL`) |
 | `--press "ms:button,..."` | scripted virtual controller for automated tests (`5000:start`, `8000:a`, `9000:ly+`, ...) |
+| `--60fps` | runs the game at a higher max framerate |
+| `--fullres` | runs the game at window resolution |
 
 Debugging aids: F12 or Ctrl+Break dumps every thread's stack to the log.
 `SWBF2_DUMP_AT=ms,...` does the same at fixed times, and `SWBF2_PROFILE_AT=start:duration`

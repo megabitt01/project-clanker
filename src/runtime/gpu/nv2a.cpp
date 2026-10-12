@@ -18,6 +18,22 @@
 
 namespace rt {
 
+// The lock for every thread but the pusher. std::mutex is not fair, so the
+// pusher (which holds the lock while it works through the push buffer) steps
+// aside whenever someone is waiting; see pusher_thread.
+struct NvLock {
+    NvLock()
+    {
+        g_nv->waiters++;
+        g_nv->lock.lock();
+        g_nv->waiters--;
+    }
+    ~NvLock() { g_nv->lock.unlock(); }
+    NvLock(const NvLock &) = delete;
+    NvLock &operator=(const NvLock &) = delete;
+};
+
+
 Nv2aState *g_nv;
 
 static constexpr double CRYSTAL_HZ = 16666666.0;
@@ -160,6 +176,8 @@ static void nv2a_write(uint32_t off, uint32_t v)
         return;
     case NV_PFIFO_CACHE1_DMA_GET:
         g_nv->dma_get = v;
+        g_nv->get_written++;
+        g_nv->pusher_cv.notify_all();
         return;
     case NV_PTIMER_INTR_0:
         reg(off) &= ~v;
@@ -219,16 +237,19 @@ static void nv2a_write(uint32_t off, uint32_t v)
         }
         if (r == NV_USER_DMA_GET) {
             g_nv->dma_get = v;
+            g_nv->get_written++;
             return;
         }
     }
     reg(off) = v;
+    if (off == NV_PFIFO_CACHE1_DMA_PUSH || off == NV_PFIFO_CACHE1_PUSH0)
+        g_nv->pusher_cv.notify_all();
 }
 
 static uint32_t mmio_read(uint32_t addr, int size)
 {
     uint32_t off = addr - NV2A_MMIO_BASE;
-    std::lock_guard<std::mutex> lk(g_nv->lock);
+    NvLock lk;
     uint32_t v = nv2a_read(off & ~3u);
     if (size == 4)
         return v;
@@ -239,7 +260,7 @@ static uint32_t mmio_read(uint32_t addr, int size)
 static void mmio_write(uint32_t addr, uint32_t value, int size)
 {
     uint32_t off = addr - NV2A_MMIO_BASE;
-    std::lock_guard<std::mutex> lk(g_nv->lock);
+    NvLock lk;
     if (size != 4) {
         // Sub-word writes (VGA CRTC index/data etc.) are merged into storage.
         uint32_t shift = (off & 3) * 8, mask = (size == 1 ? 0xFFu : 0xFFFFu) << shift;
@@ -259,6 +280,14 @@ static uint32_t pushbuffer_base()
     return nv_dma_load(inst << 4).address;
 }
 
+// The pusher only fetches while D3D has it enabled: it suspends it
+// (CACHE1_DMA_PUSH access, CACHE1_PUSH0) while resetting GET/PUT, and in
+// between the two writes GET would otherwise point into a dead push buffer.
+static bool pusher_enabled()
+{
+    return (reg(NV_PFIFO_CACHE1_DMA_PUSH) & 1) && (reg(NV_PFIFO_CACHE1_PUSH0) & 1);
+}
+
 static void pusher_thread(void *)
 {
     renderer_thread_init();
@@ -267,13 +296,35 @@ static void pusher_thread(void *)
     uint32_t method = 0, subchannel = 0, count = 0;
     bool non_increasing = false;
     for (;;) {
-        g_nv->pusher_cv.wait(lk, [] { return g_nv->dma_get != g_nv->dma_put || g_nv->present_pending; });
+        g_nv->pusher_cv.wait(lk, [] {
+            return (g_nv->dma_get != g_nv->dma_put && pusher_enabled()) || g_nv->present_pending;
+        });
         if (g_nv->present_pending) {
             g_nv->present_pending = false;
             pgraph_present(lk);
         }
         uint32_t base = pushbuffer_base();
-        while (g_nv->dma_get != g_nv->dma_put && !g_nv->present_pending) {
+        uint64_t get_gen = g_nv->get_written;
+        while (g_nv->dma_get != g_nv->dma_put && !g_nv->present_pending && pusher_enabled()) {
+            // The CPU must be able to reach the registers while the pusher
+            // runs (on hardware they are independent). D3D resets GET/PUT
+            // when it re-creates its device; a pusher that kept the lock
+            // while wandering through the stale push buffer deadlocked the
+            // game on quitting to the title screen.
+            if (g_nv->waiters.load(std::memory_order_relaxed)) {
+                lk.unlock();
+                while (g_nv->waiters.load(std::memory_order_relaxed))
+                    std::this_thread::yield();
+                lk.lock();
+                base = pushbuffer_base();
+            }
+            if (g_nv->get_written != get_gen) {
+                // GET was moved by the CPU: drop any partially parsed command.
+                get_gen = g_nv->get_written;
+                count = 0;
+                g_nv->subroutine_active = false;
+                continue;
+            }
             uint32_t word = *reinterpret_cast<volatile uint32_t *>(phys_ptr(base + g_nv->dma_get));
             g_nv->dma_get += 4;
             if (count) {
@@ -320,7 +371,7 @@ static void vblank_thread(void *)
     for (;;) {
         std::this_thread::sleep_until(next);
         next += period;
-        std::lock_guard<std::mutex> lk(g_nv->lock);
+        NvLock lk;
         g_nv->vblank_count++;
         if (g_nv->vblank_count == 600)
             kelvin_dump_histogram();
@@ -348,7 +399,7 @@ static void vblank_thread(void *)
 
 void nv2a_set_display_mode(uint32_t mode, uint32_t format, uint32_t pitch, uint32_t framebuffer)
 {
-    std::lock_guard<std::mutex> lk(g_nv->lock);
+    NvLock lk;
     g_nv->display_format = format;
     g_nv->display_pitch = pitch;
     g_nv->display_fb = framebuffer;
@@ -366,7 +417,7 @@ void nv2a_set_display_mode(uint32_t mode, uint32_t format, uint32_t pitch, uint3
 
 ScanoutInfo nv2a_scanout()
 {
-    std::lock_guard<std::mutex> lk(g_nv->lock);
+    NvLock lk;
     ScanoutInfo s;
     s.address = reg(NV_PCRTC_START) & 0x0FFFFFFF;
     s.pitch = g_nv->display_pitch;

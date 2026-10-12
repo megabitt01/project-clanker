@@ -2,6 +2,7 @@
 //
 //   SWBF2_CAPTURE_AT=ms[,ms...]   capture the frame that starts after each time
 //   SWBF2_CAPTURE_PROBE=x,y       log the render-target colour at this pixel after each draw
+//   SWBF2_CAPTURE_PROBE_PX=x,y    a second probe in render-target pixels (useful with --fullres)
 //   SWBF2_CAPTURE_SHOTS=a-b|N     write the render target to PNG after draws a..b (or every Nth)
 //   SWBF2_CAPTURE_PEEK=addr,...   log game texture globals (wrapper -> D3D texture -> data address)
 //   SWBF2_WATCH_PHYS=addr:len     log the first CPU write to a physical range once capturing starts

@@ -4,6 +4,7 @@
 #include "kelvin_state.h"
 #include "nv2a_internal.h"
 #include "../log.h"
+#include "../options.h"
 
 #include <algorithm>
 #include <map>
@@ -73,6 +74,96 @@ static void destroy(Surface *s)
     delete s;
 }
 
+float surface_scale_x() { return g_options.scale_x; }
+float surface_scale_y() { return g_options.scale_y; }
+
+static uint32_t scaled(uint32_t v, float scale)
+{
+    uint32_t r = uint32_t(float(v) * scale + 0.5f);
+    return r ? r : 1;
+}
+
+static void set_size(Surface *s, uint32_t w, uint32_t h)
+{
+    s->width = w;
+    s->height = h;
+    s->pw = scaled(w, g_options.scale_x);
+    s->ph = scaled(h, g_options.scale_y);
+}
+
+void surface_scissor(int x0, int y0, int x1, int y1)
+{
+    float sx = g_options.scale_x, sy = g_options.scale_y;
+    int px0 = int(x0 * sx + 0.5f), py0 = int(y0 * sy + 0.5f);
+    int px1 = int((x1 + 1) * sx + 0.5f), py1 = int((y1 + 1) * sy + 0.5f);
+    glScissor(px0, py0, px1 - px0, py1 - py0);
+}
+
+static GLuint g_xfer_tex, g_xfer_fbo;
+static uint32_t g_xfer_w, g_xfer_h;
+
+// A scratch RGBA8 texture/FBO at game resolution for resampled transfers.
+static void xfer_target(uint32_t w, uint32_t h)
+{
+    if (!g_xfer_tex) {
+        glGenTextures(1, &g_xfer_tex);
+        glGenFramebuffers(1, &g_xfer_fbo);
+    }
+    if (w > g_xfer_w || h > g_xfer_h) {
+        g_xfer_w = std::max(w, g_xfer_w);
+        g_xfer_h = std::max(h, g_xfer_h);
+        glBindTexture(GL_TEXTURE_2D, g_xfer_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g_xfer_w, g_xfer_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_xfer_fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_xfer_tex, 0);
+    }
+}
+
+static bool is_scaled() { return g_options.scale_x != 1.0f || g_options.scale_y != 1.0f; }
+
+void surface_read(Surface *s, int x, int y, int w, int h, unsigned format, unsigned type, void *dst, int row_length)
+{
+    glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
+    if (!is_scaled()) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, surface_fbo(s));
+        glReadPixels(x, y, w, h, format, type, dst);
+    } else {
+        xfer_target(w, h);
+        float sx = g_options.scale_x, sy = g_options.scale_y;
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, surface_fbo(s));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_xfer_fbo);
+        glBlitFramebuffer(int(x * sx + 0.5f), int(y * sy + 0.5f), int((x + w) * sx + 0.5f), int((y + h) * sy + 0.5f), 0,
+                          0, w, h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_xfer_fbo);
+        glReadPixels(0, 0, w, h, format, type, dst);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, surface_fbo(s));
+    }
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+}
+
+void surface_write(Surface *s, int x, int y, int w, int h, unsigned format, unsigned type, const void *src,
+                   int row_length)
+{
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+    if (!is_scaled()) {
+        glBindTexture(GL_TEXTURE_2D, s->tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, format, type, src);
+    } else {
+        xfer_target(w, h);
+        glBindTexture(GL_TEXTURE_2D, g_xfer_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, format, type, src);
+        float sx = g_options.scale_x, sy = g_options.scale_y;
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_xfer_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, surface_fbo(s));
+        glBlitFramebuffer(0, 0, w, h, int(x * sx + 0.5f), int(y * sy + 0.5f), int((x + w) * sx + 0.5f),
+                          int((y + h) * sy + 0.5f), GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
 static GLuint alloc_texture(uint32_t w, uint32_t h, uint32_t fmt, bool depth)
 {
     GLuint tex;
@@ -120,15 +211,14 @@ static Surface *get_surface(uint32_t addr, uint32_t pitch, uint32_t w, uint32_t 
                 return s;
             // Grow, preserving the existing contents.
             uint32_t nw = w > s->width ? w : s->width, nh = h > s->height ? h : s->height;
-            GLuint nt = alloc_texture(nw, nh, fmt, depth);
+            uint32_t opw = s->pw, oph = s->ph;
+            set_size(s, nw, nh);
+            GLuint nt = alloc_texture(s->pw, s->ph, fmt, depth);
             if (rt_glCopyImageSubData)
-                glCopyImageSubData(s->tex, GL_TEXTURE_2D, 0, 0, 0, 0, nt, GL_TEXTURE_2D, 0, 0, 0, 0, s->width,
-                                   s->height, 1);
+                glCopyImageSubData(s->tex, GL_TEXTURE_2D, 0, 0, 0, 0, nt, GL_TEXTURE_2D, 0, 0, 0, 0, opw, oph, 1);
             drop_fbos(s->tex);
             glDeleteTextures(1, &s->tex);
             s->tex = nt;
-            s->width = nw;
-            s->height = nh;
             LOG_DEBUG("surface", "grew %s surface %08X to %ux%u", depth ? "zeta" : "color", addr, nw, nh);
             return s;
         }
@@ -140,12 +230,11 @@ static Surface *get_surface(uint32_t addr, uint32_t pitch, uint32_t w, uint32_t 
     Surface *s = new Surface();
     s->addr = addr;
     s->pitch = pitch;
-    s->width = w;
-    s->height = h;
+    set_size(s, w, h);
     s->format = fmt;
     s->depth = depth;
     s->swizzled = swizzled;
-    s->tex = alloc_texture(w, h, fmt, depth);
+    s->tex = alloc_texture(s->pw, s->ph, fmt, depth);
     g_surfaces.push_back(s);
     LOG_DEBUG("surface", "new %s surface %08X %ux%u fmt %u pitch %u%s", depth ? "zeta" : "color", addr, w, h, fmt,
               pitch, swizzled ? " swizzled" : "");
@@ -163,8 +252,11 @@ static void surface_dims(uint32_t &w, uint32_t &h, bool &swizzled)
         uint32_t ch = kr(NV097_SET_SURFACE_CLIP_HORIZONTAL), cv = kr(NV097_SET_SURFACE_CLIP_VERTICAL);
         w = (ch & 0xFFFF) + (ch >> 16);
         h = (cv & 0xFFFF) + (cv >> 16);
+        // Anti-aliased surfaces: the clip is in pixels, memory holds samples.
+        uint32_t aa = (fmt >> 12) & 0xF;
+        if (aa == 1 || aa == 2) w *= 2;
+        if (aa == 2) h *= 2;
     }
-    // Anti-aliased surfaces: the clip rectangle is already in sample space.
     if (w == 0) w = 640;
     if (h == 0) h = 480;
 }
@@ -209,7 +301,7 @@ bool surface_bind(Surface *color, Surface *zeta)
     if (!color && !zeta)
         return false;
     // GL requires matching attachment sizes: drop a mismatched zeta buffer.
-    if (color && zeta && (color->width != zeta->width || color->height != zeta->height))
+    if (color && zeta && (color->pw != zeta->pw || color->ph != zeta->ph))
         zeta = nullptr;
     auto key = std::make_pair(color ? color->tex : 0u, zeta ? zeta->tex : 0u);
     auto it = g_fbos.find(key);
@@ -237,7 +329,7 @@ bool surface_bind(Surface *color, Surface *zeta)
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     }
     Surface *s = color ? color : zeta;
-    glViewport(0, 0, s->width, s->height);
+    glViewport(0, 0, s->pw, s->ph);
     return true;
 }
 

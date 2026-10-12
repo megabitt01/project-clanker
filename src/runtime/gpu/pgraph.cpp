@@ -162,8 +162,11 @@ void pgraph_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32
         // Pattern object: its colour methods load PGRAPH_PATT_COLOR0/1
         // (0x400B10/14). D3D uses PATT_COLOR0 as a GPU progress marker that
         // the CPU polls (see D3D_BlockOnTime), so these must take effect.
-        if (method == 0x310 || method == 0x314)
+        if (method == 0x310 || method == 0x314) {
+            // A fence the CPU polls: queued occlusion reports must land first.
+            kelvin_resolve_reports();
             reg(0x400B10 + (method - 0x310)) = parameter;
+        }
         else
             log_once(sc.object_class, method, parameter, "unhandled pattern method");
         break;

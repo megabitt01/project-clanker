@@ -57,7 +57,8 @@ void host_init(const HostConfig &cfg)
     if (cfg.fullscreen)
         flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     g_window = SDL_CreateWindow("Star Wars Battlefront II", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                640 * cfg.window_scale, 480 * cfg.window_scale, flags);
+                                cfg.width ? cfg.width : 640 * cfg.window_scale,
+                                cfg.height ? cfg.height : 480 * cfg.window_scale, flags);
     if (!g_window)
         fatal("SDL_CreateWindow failed: %s", SDL_GetError());
     g_gl = SDL_GL_CreateContext(g_window);
@@ -70,7 +71,11 @@ void host_init(const HostConfig &cfg)
         fatal("Could not create an OpenGL 3.3+ context: %s", SDL_GetError());
     // The GPU thread owns the context from here on.
     SDL_GL_MakeCurrent(g_window, nullptr);
-    LOG_INFO("host", "window %dx%d created", 640 * cfg.window_scale, 480 * cfg.window_scale);
+    {
+        int ww, wh;
+        SDL_GetWindowSize(g_window, &ww, &wh);
+        LOG_INFO("host", "window %dx%d created", ww, wh);
+    }
 }
 
 // ---- gamepads ---------------------------------------------------------------------

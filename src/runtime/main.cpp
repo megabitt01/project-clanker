@@ -10,6 +10,7 @@
 #include "log.h"
 #include "memory.h"
 #include "mmio.h"
+#include "options.h"
 #include "xbe.h"
 
 #include <windows.h>
@@ -20,6 +21,8 @@
 #include <vector>
 
 using namespace rt;
+
+Options rt::g_options;
 
 static std::string exe_dir()
 {
@@ -92,9 +95,32 @@ extern "C" __declspec(dllexport) void __cdecl swbf2_runtime_main(void *space, un
     kthread_init(); // first: its TLS slot must be < 64 (GL drivers allocate many)
 
     // The window and GL context are created up front, on the main thread.
+    g_options.fps60 = has_flag(argc, argv.data(), "--60fps");
+    g_options.fullres = has_flag(argc, argv.data(), "--fullres");
+    {
+        std::string res = arg_value(argc, argv.data(), "--resolution");
+        if (!res.empty() && sscanf(res.c_str(), "%dx%d", &g_options.width, &g_options.height) != 2)
+            g_options.width = g_options.height = 0;
+    }
     HostConfig hc;
     hc.fullscreen = has_flag(argc, argv.data(), "--fullscreen");
+    hc.width = g_options.width;
+    hc.height = g_options.height;
+    if (g_options.fullres && !hc.width) {
+        hc.width = 1280; // a 16:9 window by default
+        hc.height = 720;
+    }
     host_init(hc);
+    if (g_options.fullres) {
+        int w = g_options.width, h = g_options.height;
+        if (!w || hc.fullscreen)
+            host_window_size(w, h);
+        g_options.render_width = w;
+        g_options.render_height = h;
+        g_options.scale_x = w / 640.0f;
+        g_options.scale_y = h / 480.0f;
+        LOG_INFO("main", "--fullres: rendering at %dx%d", w, h);
+    }
     {
         std::string script = arg_value(argc, argv.data(), "--press");
         if (!script.empty())

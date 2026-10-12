@@ -5,6 +5,7 @@
 #include "../host/png.h"
 #include "../log.h"
 #include "../memory.h"
+#include "../options.h"
 
 #include <SDL.h>
 #include <string>
@@ -166,10 +167,12 @@ void renderer_present_texture(unsigned tex, uint32_t width, uint32_t height, boo
     glClearColor(0, 0, 0, 1);
     glViewport(0, 0, w, h);
     glClear(GL_COLOR_BUFFER_BIT);
-    // Letterbox to 4:3.
+    // Letterbox to the game's aspect ratio: 4:3, or the render size's with
+    // --fullres (the game then renders for that aspect).
+    int aw = g_options.fullres ? g_options.render_width : 4, ah = g_options.fullres ? g_options.render_height : 3;
     int vw = w, vh = h;
-    if (vw * 3 > vh * 4) vw = vh * 4 / 3;
-    else vh = vw * 3 / 4;
+    if (int64_t(vw) * ah > int64_t(vh) * aw) vw = int(int64_t(vh) * aw / ah);
+    else vh = int(int64_t(vw) * ah / aw);
     glViewport((w - vw) / 2, (h - vh) / 2, vw, vh);
     glUseProgram(g_present_prog);
     glUniform1i(g_u_flip, flip_y ? 1 : 0);

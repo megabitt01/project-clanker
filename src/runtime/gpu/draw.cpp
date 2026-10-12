@@ -27,7 +27,7 @@ struct Program {
     GLuint prog = 0;
     uint64_t key = 0;
     std::string vs, fs;
-    GLint c, surfaceInfo, fogInfo, psConst0, psConst1, finalConst0, finalConst1, fogColor, texScale, bumpMat,
+    GLint c, surfaceInfo, fogInfo, pointScale, psConst0, psConst1, finalConst0, finalConst1, fogColor, texScale, bumpMat,
         bumpScale, bumpOffset, alphaRef, eyeVec, compositeMat, texMat, texMatEnable;
 };
 std::unordered_map<uint64_t, Program> g_programs;
@@ -59,7 +59,7 @@ std::string vs_header(bool flat)
     for (int i = 0; i < 16; i++)
         s += "layout(location = " + std::to_string(i) + ") in vec4 v" + std::to_string(i) + ";\n";
     std::string q = flat ? "flat " : "";
-    s += "uniform vec4 c[192];\nuniform vec4 surfaceInfo;\nuniform vec4 fogInfo;\n"
+    s += "uniform vec4 c[192];\nuniform vec4 surfaceInfo;\nuniform vec4 fogInfo;\nuniform float pointScale;\n"
          "uniform mat4 compositeMat;\nuniform mat4 texMat[4];\nuniform int texMatEnable[4];\n";
     s += q + "out vec4 vtx_D0;\n" + q + "out vec4 vtx_D1;\n" + q + "out vec4 vtx_B0;\n" + q + "out vec4 vtx_B1;\n";
     s += "out float vtx_Fog;\nout vec4 vtx_T0;\nout vec4 vtx_T1;\nout vec4 vtx_T2;\nout vec4 vtx_T3;\n";
@@ -82,6 +82,10 @@ std::string vs_header(bool flat)
 // Converts screen-space oPos (as the NV2A expects) to GL clip space.
 // Rendering is done in memory orientation (row 0 = top = GL row 0).
 const char *k_vs_epilogue = R"(
+  // The NV2A snaps screen positions to 1/16 pixel. Doing the same in the
+  // game's pixel space keeps edges shared by separately transformed meshes
+  // closed when rendering at a higher resolution.
+  oPos.xy = floor(oPos.xy * 16.0 + 0.5) / 16.0;
   oPos.x = oPos.x * (2.0 / surfaceInfo.x) - 1.0;
   oPos.y = oPos.y * (2.0 / surfaceInfo.y) - 1.0;
   if (surfaceInfo.w != surfaceInfo.z)
@@ -91,7 +95,7 @@ const char *k_vs_epilogue = R"(
   else oPos.w = clamp(oPos.w, 5.42101e-20, 1.84467e+19);
   oPos.xyz *= oPos.w;
   gl_Position = oPos;
-  gl_PointSize = max(oPts.x, 1.0);
+  gl_PointSize = max(oPts.x, 1.0) * pointScale;
   vtx_D0 = clamp(oD0, 0.0, 1.0);
   vtx_D1 = clamp(oD1, 0.0, 1.0);
   vtx_B0 = clamp(oB0, 0.0, 1.0);
@@ -134,6 +138,19 @@ uint64_t fnv(const void *p, size_t n, uint64_t h = 0xcbf29ce484222325ull)
     return h;
 }
 
+// Multisampled surfaces (SET_SURFACE_FORMAT anti-aliasing field): screen
+// coordinates, window clips and clear rectangles are in pixels, while the
+// surface memory holds 2x1 or 2x2 samples per pixel. The game uses this for
+// its stencil shadow passes (a 320x240 4x surface over the 640x480 buffer).
+void aa_factor(int &fx, int &fy)
+{
+    switch ((kr(NV097_SET_SURFACE_FORMAT) >> 12) & 0xF) {
+    case 1: fx = 2; fy = 1; break;  // CENTER_CORNER_2
+    case 2: fx = 2; fy = 2; break;  // SQUARE_OFFSET_4
+    default: fx = fy = 1; break;
+    }
+}
+
 bool vertex_program_mode() { return (kr(NV097_SET_TRANSFORM_EXECUTION_MODE) & 3) == 2; }
 
 uint64_t vs_program_hash()
@@ -173,6 +190,7 @@ Program &get_program(const PshState &ps, bool programmable, bool flat)
     p.c = loc(p.prog, "c");
     p.surfaceInfo = loc(p.prog, "surfaceInfo");
     p.fogInfo = loc(p.prog, "fogInfo");
+    p.pointScale = loc(p.prog, "pointScale");
     p.psConst0 = loc(p.prog, "psConst0");
     p.psConst1 = loc(p.prog, "psConst1");
     p.finalConst0 = loc(p.prog, "finalConst0");
@@ -209,6 +227,7 @@ void set_uniforms(Program &p, uint32_t sw, uint32_t sh, const TextureBinding *tb
     if (p.c >= 0)
         glUniform4fv(p.c, NV2A_VERTEXSHADER_CONSTANTS, &g_kd.constants[0][0]);
     glUniform4f(p.surfaceInfo, float(sw), float(sh), kf(NV097_SET_CLIP_MIN), kf(NV097_SET_CLIP_MAX));
+    glUniform1f(p.pointScale, surface_scale_y());
     float fogmode = 0;
     switch (kr(NV097_SET_FOG_MODE)) {
     case 0x2601: case 0x804: fogmode = 1; break;
@@ -326,10 +345,12 @@ void apply_state(Surface *color, Surface *zeta)
     // Scissor from window clip rectangle 0 (inclusive coordinates).
     Surface *s = color ? color : zeta;
     uint32_t wh = kr(NV097_SET_WINDOW_CLIP_HORIZONTAL), wv = kr(NV097_SET_WINDOW_CLIP_VERTICAL);
-    int x0 = wh & 0xFFFF, x1 = wh >> 16, y0 = wv & 0xFFFF, y1 = wv >> 16;
+    int fx, fy;
+    aa_factor(fx, fy);
+    int x0 = (wh & 0xFFFF) * fx, x1 = ((wh >> 16) + 1) * fx - 1, y0 = (wv & 0xFFFF) * fy, y1 = ((wv >> 16) + 1) * fy - 1;
     if ((wh || wv) && x1 >= x0 && y1 >= y0 && (x0 > 0 || y0 > 0 || x1 + 1 < int(s->width) || y1 + 1 < int(s->height))) {
         glEnable(GL_SCISSOR_TEST);
-        glScissor(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+        surface_scissor(x0, y0, x1, y1);
     } else {
         glDisable(GL_SCISSOR_TEST);
     }
@@ -584,6 +605,32 @@ std::string describe_draw(const Program &p, uint32_t prim, Surface *color, Surfa
     return d;
 }
 
+GLuint g_feedback_tex;
+uint32_t g_feedback_w, g_feedback_h;
+
+void bind_feedback_copy(int stage, Surface *color)
+{
+    glActiveTexture(GL_TEXTURE0 + stage);
+    GLint params[5];
+    const GLenum names[5] = {GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+                             GL_TEXTURE_WRAP_R};
+    for (int k = 0; k < 5; k++)
+        glGetTexParameteriv(GL_TEXTURE_2D, names[k], &params[k]);
+    if (!g_feedback_tex)
+        glGenTextures(1, &g_feedback_tex);
+    glBindTexture(GL_TEXTURE_2D, g_feedback_tex);
+    if (g_feedback_w != color->pw || g_feedback_h != color->ph) {
+        g_feedback_w = color->pw;
+        g_feedback_h = color->ph;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g_feedback_w, g_feedback_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+    glCopyImageSubData(color->tex, GL_TEXTURE_2D, 0, 0, 0, 0, g_feedback_tex, GL_TEXTURE_2D, 0, 0, 0, 0, color->pw,
+                       color->ph, 1);
+    for (int k = 0; k < 5; k++)
+        glTexParameteri(GL_TEXTURE_2D, names[k], params[k]);
+}
+
 } // namespace
 
 void draw_init()
@@ -627,6 +674,14 @@ void draw_flush()
     }
     for (int i = 0; i < 4; i++)
         ps.tex_type[i] = tb[i].type;
+    // Sampling the surface being rendered to is undefined in GL (the GPU
+    // works in tiles and reads texels other tiles have already overwritten,
+    // which shows as a lattice of artifacts at high resolutions). The game
+    // does this in its final composite; sample a copy taken before the draw.
+    if (color)
+        for (int i = 0; i < 4; i++)
+            if (tb[i].tex == color->tex && tb[i].target == GL_TEXTURE_2D)
+                bind_feedback_copy(i, color);
     if (!surface_bind(color, zeta)) {
         if (capture_active())
             capture_draw("DROPPED draw: no surface bound", nullptr);
@@ -657,7 +712,9 @@ void draw_flush()
     bool programmable = vertex_program_mode();
     Program &p = get_program(ps, programmable, ps.flat_shade != 0);
     glUseProgram(p.prog);
-    set_uniforms(p, s->width, s->height, tb);
+    int fx, fy;
+    aa_factor(fx, fy);
+    set_uniforms(p, s->width / fx, s->height / fy, tb);
 
     AttrInfo attrs[16];
     decode_attrs(attrs);
@@ -740,19 +797,23 @@ void draw_flush()
 }
 
 // ---- occlusion reports (NV097 ZPASS pixel count) ------------------------------
-static std::vector<GLuint> g_queries, g_free_queries;
-static uint32_t g_zpass_total;
-
-static void collect_queries()
-{
-    for (GLuint q : g_queries) {
-        GLuint n = 0;
-        glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
-        g_zpass_total += n;
-        g_free_queries.push_back(q);
-    }
-    g_queries.clear();
-}
+// GET_REPORT writes the number of samples that passed since the last
+// CLEAR_REPORT_VALUE. Reading GL query results right away would stall the
+// GPU once per report (the game issues hundreds a frame), so reports are
+// queued and resolved in one batch at the next point where the CPU can
+// observe GPU progress (fences, semaphores, flips): D3D only reads a report
+// once its fence has passed.
+namespace {
+struct PendingReport {
+    uint32_t addr;
+    std::vector<GLuint> queries;
+};
+std::vector<GLuint> g_epoch;          // queries since the last CLEAR_REPORT_VALUE
+std::vector<GLuint> g_retired;        // from earlier epochs, freed once resolved
+std::vector<GLuint> g_free_queries;
+std::vector<PendingReport> g_pending;
+std::unordered_map<GLuint, GLuint> g_results;
+} // namespace
 
 void draw_query_begin()
 {
@@ -773,36 +834,70 @@ void draw_query_end()
     if (!g_active_query)
         return;
     glEndQuery(GL_SAMPLES_PASSED);
-    g_queries.push_back(g_active_query);
+    g_epoch.push_back(g_active_query);
     g_active_query = 0;
+}
+
+static void write_report(uint32_t addr, uint32_t count)
+{
+    uint8_t *p = phys_ptr(addr);
+    uint64_t timestamp = 0x0011223344556677ull;
+    uint32_t done = 0;
+    memcpy(p, &timestamp, 8);
+    memcpy(p + 8, &count, 4);
+    memcpy(p + 12, &done, 4);
+}
+
+void draw_reports_resolve()
+{
+    if (g_pending.empty())
+        return;
+    for (const PendingReport &r : g_pending) {
+        uint32_t total = 0;
+        for (GLuint q : r.queries) {
+            auto it = g_results.find(q);
+            if (it == g_results.end()) {
+                GLuint n = 0;
+                glGetQueryObjectuiv(q, GL_QUERY_RESULT, &n);
+                it = g_results.emplace(q, n).first;
+            }
+            total += it->second;
+        }
+        write_report(r.addr, total);
+    }
+    g_pending.clear();
+    g_results.clear();
+    g_free_queries.insert(g_free_queries.end(), g_retired.begin(), g_retired.end());
+    g_retired.clear();
 }
 
 void draw_report_clear()
 {
     if (capture_active())
         capture_draw("report clear", nullptr);
-    collect_queries();
-    g_zpass_total = 0;
+    g_retired.insert(g_retired.end(), g_epoch.begin(), g_epoch.end());
+    g_epoch.clear();
+    if (g_pending.empty()) {
+        g_free_queries.insert(g_free_queries.end(), g_retired.begin(), g_retired.end());
+        g_retired.clear();
+    }
 }
 
 void draw_report_write(uint32_t parameter)
 {
-    collect_queries();
     DmaObject d = nv_dma_load(kr(NV097_SET_CONTEXT_DMA_REPORT));
     uint32_t off = parameter & 0x00FFFFFF;
     if (d.address + off + 16 > XBOX_RAM_SIZE)
         return;
-    uint8_t *p = phys_ptr(d.address + off);
-    uint64_t timestamp = 0x0011223344556677ull;
-    uint32_t done = 0;
-    memcpy(p, &timestamp, 8);
-    memcpy(p + 8, &g_zpass_total, 4);
-    memcpy(p + 12, &done, 4);
+    g_pending.push_back({d.address + off, g_epoch});
     if (capture_active()) {
+        draw_reports_resolve();
         char b[96];
-        snprintf(b, sizeof b, "report %08X = %u", parameter, g_zpass_total);
+        snprintf(b, sizeof b, "report %08X = %u", parameter, *reinterpret_cast<uint32_t *>(phys_ptr(d.address + off + 8)));
         capture_draw(b, nullptr);
     }
+    if (g_pending.size() > 4096)
+        draw_reports_resolve();
 }
 
 void draw_clear(uint32_t flags)
@@ -812,9 +907,11 @@ void draw_clear(uint32_t flags)
     if (!surface_bind(color, zeta))
         return;
     uint32_t xr = kr(NV097_SET_CLEAR_RECT_HORIZONTAL), yr = kr(NV097_SET_CLEAR_RECT_VERTICAL);
-    int x0 = xr & 0xFFFF, x1 = xr >> 16, y0 = yr & 0xFFFF, y1 = yr >> 16;
+    int fx, fy;
+    aa_factor(fx, fy);
+    int x0 = (xr & 0xFFFF) * fx, x1 = ((xr >> 16) + 1) * fx - 1, y0 = (yr & 0xFFFF) * fy, y1 = ((yr >> 16) + 1) * fy - 1;
     glEnable(GL_SCISSOR_TEST);
-    glScissor(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
+    surface_scissor(x0, y0, x1, y1);
     if (color) {
         float c[4];
         unpack_argb(kr(NV097_SET_COLOR_CLEAR_VALUE), c);

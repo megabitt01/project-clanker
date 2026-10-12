@@ -7,7 +7,8 @@ namespace rt {
 struct Surface {
     uint32_t addr = 0;      // physical address
     uint32_t pitch = 0;
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0;   // in the game's pixels
+    uint32_t pw = 0, ph = 0;          // GL texture size (scaled with --fullres)
     uint32_t format = 0;    // NV097 surface colour format (1-10) or zeta format (1 = Z16, 2 = Z24S8)
     bool depth = false;
     bool swizzled = false;
@@ -40,6 +41,19 @@ Surface *surface_containing(uint32_t addr, uint32_t &x, uint32_t &y);
 // rendered to it (the GL copy is then stale and is discarded).
 bool surface_is_stale(Surface *s);
 void surface_discard(Surface *s);
+
+// Render scaling (--fullres): surfaces are allocated at their size times the
+// scale, and rendering is scaled to match. Coordinates passed to these
+// helpers are in the game's pixels.
+float surface_scale_x();
+float surface_scale_y();
+// glScissor for an inclusive rectangle.
+void surface_scissor(int x0, int y0, int x1, int y1);
+// Pixel transfer between a colour surface and memory (resampled when scaled).
+// The surface's FBO is left bound for reading.
+void surface_read(Surface *s, int x, int y, int w, int h, unsigned format, unsigned type, void *dst, int row_length);
+void surface_write(Surface *s, int x, int y, int w, int h, unsigned format, unsigned type, const void *src,
+                   int row_length);
 
 
 } // namespace rt

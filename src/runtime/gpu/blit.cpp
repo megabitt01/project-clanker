@@ -69,13 +69,14 @@ static void image_blit()
         glBindFramebuffer(GL_READ_FRAMEBUFFER, surface_fbo(ss));
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, surface_fbo(ds));
         glDisable(GL_SCISSOR_TEST);
-        glBlitFramebuffer(ssx + sx, ssy + sy, ssx + sx + w, ssy + sy + h, dx, dy, dx + w, dy + h,
-                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, surface_fbo(ds));
-        glPixelStorei(GL_PACK_ROW_LENGTH, dpitch / 4);
+        float fx = surface_scale_x(), fy = surface_scale_y();
+        auto px = [&](uint32_t v) { return GLint(v * fx + 0.5f); };
+        auto py = [&](uint32_t v) { return GLint(v * fy + 0.5f); };
+        glBlitFramebuffer(px(ssx + sx), py(ssy + sy), px(ssx + sx + w), py(ssy + sy + h), px(dx), py(dy), px(dx + w),
+                          py(dy + h), GL_COLOR_BUFFER_BIT, GL_NEAREST);
         if (dst + (dy + h - 1) * dpitch + (dx + w) * 4 <= XBOX_RAM_SIZE)
-            glReadPixels(dx, dy, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, phys_ptr(dst + dy * dpitch + dx * 4));
-        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            surface_read(ds, dx, dy, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, phys_ptr(dst + dy * dpitch + dx * 4),
+                         dpitch / 4);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         surface_mark_written(ds); // after the write-back, so the memory signature matches
         return;
@@ -85,11 +86,8 @@ static void image_blit()
     uint32_t tx = 0, ty = 0;
     if (Surface *ds = surface_containing(dst, tx, ty)) {
         if (bpp == 4) {
-            glBindTexture(GL_TEXTURE_2D, ds->tex);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, dpitch / 4);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, tx + dx, ty + dy, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
-                            phys_ptr(dst + dy * dpitch + dx * 4));
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            surface_write(ds, tx + dx, ty + dy, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
+                          phys_ptr(dst + dy * dpitch + dx * 4), dpitch / 4);
             surface_mark_written(ds);
         }
     }

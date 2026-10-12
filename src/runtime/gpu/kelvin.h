@@ -6,6 +6,7 @@
 namespace rt {
 
 void kelvin_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32_t method, uint32_t parameter);
+void kelvin_resolve_reports();
 void kelvin_present(std::unique_lock<std::mutex> &lk);
 void kelvin_dump_histogram();
 

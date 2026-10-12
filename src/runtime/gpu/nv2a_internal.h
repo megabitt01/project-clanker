@@ -7,6 +7,7 @@
 #include <intrin.h>
 #include <condition_variable>
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 
 namespace rt {
@@ -130,6 +131,8 @@ struct Nv2aState {
 
     // DMA pusher
     uint32_t dma_put = 0, dma_get = 0;
+    uint64_t get_written = 0;   // CPU writes to DMA_GET (resets the pusher's parse state)
+    std::atomic<int> waiters{0}; // threads other than the pusher waiting for `lock`
     uint32_t subroutine_return = 0;
     bool subroutine_active = false;
     uint64_t methods_processed = 0;

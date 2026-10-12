@@ -42,6 +42,7 @@ void hle_install_all()
     hle_install_dsound();
     hle_install_xnet();
     hle_install_xmv_trace();
+    hle_install_enhancements();
     game_install_hooks();
 }
 

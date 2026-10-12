@@ -1,5 +1,6 @@
 // HAL, AV, EEPROM settings, XBE section loading and exported kernel data.
 #include "kexports.h"
+#include "../hle/hook.h"
 #include "../log.h"
 #include "../xbe.h"
 #include "../gpu/nv2a.h"
@@ -84,7 +85,8 @@ KEXPORT(void) kx_AvSendTVEncoderOption(void *RegisterBase, uint32_t Option, uint
     constexpr uint32_t AV_FLAGS_60Hz = 0x00400000u;
     if (Result) {
         if (Option == 6)
-            *Result = AV_PACK_HDTV | AV_STANDARD_NTSC_M | AV_FLAGS_60Hz;
+            *Result = AV_PACK_HDTV | AV_STANDARD_NTSC_M | AV_FLAGS_60Hz |
+                      (enh_widescreen() ? 0x00010000u : 0u); // AV_FLAGS_WIDESCREEN, as in the EEPROM
         else
             *Result = 0;
     }
@@ -111,7 +113,9 @@ KEXPORT(NTSTATUS) kx_ExQueryNonVolatileSetting(uint32_t ValueIndex, uint32_t *Ty
     uint32_t blob_len = 0;
     switch (ValueIndex) {
     case 0x7: dword = 1; break;                 // XC_LANGUAGE: English
-    case 0x8: dword = 0; break;                 // XC_VIDEO: flags live in bits 16+; plain 480i
+    case 0x8:                                   // XC_VIDEO: flags live in bits 16+; plain 480i
+        dword = enh_widescreen() ? 0x00010000 : 0; // widescreen (--fullres with a wide window)
+        break;
     case 0x9: dword = 0x00010001; break;        // XC_AUDIO: stereo + Dolby Digital allowed
     case 0xA: dword = 0; break;                 // XC_PARENTAL_CONTROL_GAMES: off
     case 0xB: dword = 0; break;                 // XC_PARENTAL_CONTROL_PASSWORD

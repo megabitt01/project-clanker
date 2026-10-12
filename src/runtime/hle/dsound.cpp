@@ -160,6 +160,8 @@ struct Voice {
 };
 
 std::recursive_mutex g_lock;
+bool g_trace = getenv("SWBF2_TRACE_DSOUND") != nullptr;
+#define DSTRACE(...) do { if (g_trace) LOG_INFO("dstrace", __VA_ARGS__); } while (0)
 DS3DLISTENER g_listener = {64, {0, 0, 0}, {0, 0, 0}, {0, 0, 1}, {0, 1, 0}, 1, 1, 1};
 std::vector<Voice *> g_voices;
 uint32_t g_dsound_obj[16] = {'DSND'}; // the IDirectSound singleton (contents unused)
@@ -406,21 +408,31 @@ void mix_into(float *dst, int frames, float l, float r, int i, const float g[2][
     dst[i * 2 + 1] += l * g[0][1] + r * g[1][1];
 }
 
+// Completions are delivered after the mixer lock is released, by which time
+// the game may already have released the stream: they carry everything they
+// need instead of pointing at the voice.
 struct Completion {
-    Voice *voice;
+    void *callback, *context;
     XMEDIAPACKET pkt;
     uint32_t status;
 };
+Completion completion(const Voice *v, const XMEDIAPACKET &pkt, uint32_t status)
+{
+    return {v->callback, v->context, pkt, status};
+}
 
 void mix_buffer(Voice *v, float *dst, int frames, const float g[2][2])
 {
     uint32_t total = frames_from_bytes(v, v->bytes);
     uint32_t pstart = frames_from_bytes(v, v->play_start);
     uint32_t pend = v->play_len ? pstart + frames_from_bytes(v, v->play_len) : total;
-    uint32_t lstart = frames_from_bytes(v, v->loop_start);
-    uint32_t lend = v->loop_len ? lstart + frames_from_bytes(v, v->loop_len) : pend;
+    // The loop region, like the play cursor, is relative to the play region.
+    // Sound banks are one big buffer with a play region per sound.
     if (pend > total) pend = total;
-    if (lend > total) lend = total;
+    uint32_t lstart = pstart + frames_from_bytes(v, v->loop_start);
+    uint32_t lend = v->loop_len ? lstart + frames_from_bytes(v, v->loop_len) : pend;
+    if (lend > pend) lend = pend;
+    if (lstart >= lend) lstart = pstart;
     double step = double(v->freq ? v->freq : v->rate) / AUDIO_RATE;
     for (int i = 0; i < frames; i++) {
         uint32_t f = uint32_t(v->pos);
@@ -467,12 +479,12 @@ void mix_stream(Voice *v, float *dst, int frames, const float g[2][2], std::vect
         v->fifo_base++;
     }
     while (!v->packets.empty() && v->packets.front().end_frame <= consumed) {
-        done.push_back({v, v->packets.front().pkt, XMEDIAPACKET_STATUS_SUCCESS});
+        done.push_back(completion(v, v->packets.front().pkt, XMEDIAPACKET_STATUS_SUCCESS));
         v->packets.pop_front();
     }
     // A packet too short to decode anything completes immediately.
     if (!v->packets.empty() && v->fifo.empty() && v->packets.front().end_frame <= v->fifo_base + 1) {
-        done.push_back({v, v->packets.front().pkt, XMEDIAPACKET_STATUS_SUCCESS});
+        done.push_back(completion(v, v->packets.front().pkt, XMEDIAPACKET_STATUS_SUCCESS));
         v->packets.pop_front();
     }
 }
@@ -485,8 +497,8 @@ void complete_packet(const Completion &c)
         *c.pkt.pdwCompletedSize = c.status == XMEDIAPACKET_STATUS_SUCCESS ? c.pkt.dwMaxSize : 0;
     if (c.pkt.pdwStatus)
         *c.pkt.pdwStatus = c.status;
-    if (c.voice->callback)
-        reinterpret_cast<XMediaCallback>(c.voice->callback)(c.voice->context, c.pkt.pContext, c.status);
+    if (c.callback)
+        reinterpret_cast<XMediaCallback>(c.callback)(c.context, c.pkt.pContext, c.status);
     else if (c.pkt.hCompletionEvent)
         kx_NtSetEvent(c.pkt.hCompletionEvent, nullptr);
 }
@@ -583,7 +595,7 @@ void delete_voice(Voice *v)
     {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         for (auto &p : v->packets)
-            flushed.push_back({v, p.pkt, XMEDIAPACKET_STATUS_FLUSHED});
+            flushed.push_back(completion(v, p.pkt, XMEDIAPACKET_STATUS_FLUSHED));
         v->packets.clear();
         for (size_t i = 0; i < g_voices.size(); i++)
             if (g_voices[i] == v) {
@@ -616,7 +628,7 @@ void stream_flush(Voice *v)
     {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         for (auto &p : v->packets)
-            flushed.push_back({v, p.pkt, XMEDIAPACKET_STATUS_FLUSHED});
+            flushed.push_back(completion(v, p.pkt, XMEDIAPACKET_STATUS_FLUSHED));
         v->packets.clear();
         v->fifo.clear();
         v->fifo_base = 0;
@@ -823,6 +835,7 @@ static uint32_t __stdcall hle_Buffer_Release(void *b)
 static int32_t __stdcall hle_Buffer_SetBufferData(void *b, const void *data, uint32_t bytes)
 {
     VOICE(b);
+    DSTRACE("%p SetBufferData %p %u", b, data, bytes);
     LOCK;
     v->data = static_cast<const uint8_t *>(data);
     v->bytes = bytes;
@@ -835,15 +848,18 @@ static int32_t __stdcall hle_Buffer_SetBufferData(void *b, const void *data, uin
 static int32_t __stdcall hle_Buffer_SetPlayRegion(void *b, uint32_t start, uint32_t length)
 {
     VOICE(b);
+    DSTRACE("%p SetPlayRegion %u %u (pos %.0f playing %d)", b, start, length, v->pos, v->playing);
     LOCK;
     v->play_start = start;
     v->play_len = length;
+    v->cached_block = -1; // the bank memory may have been reloaded since the last decode
     return DS_OK;
 }
 
 static int32_t __stdcall hle_Buffer_SetLoopRegion(void *b, uint32_t start, uint32_t length)
 {
     VOICE(b);
+    DSTRACE("%p SetLoopRegion %u %u", b, start, length);
     LOCK;
     v->loop_start = start;
     v->loop_len = length;
@@ -853,11 +869,13 @@ static int32_t __stdcall hle_Buffer_SetLoopRegion(void *b, uint32_t start, uint3
 static int32_t __stdcall hle_Buffer_Play(void *b, uint32_t r1, uint32_t r2, uint32_t flags)
 {
     VOICE(b);
+    DSTRACE("%p Play flags %X (pos %.0f playing %d)", b, flags, v->pos, v->playing);
     LOCK;
     v->looping = (flags & DSBPLAY_LOOPING) != 0;
-    if ((flags & DSBPLAY_FROMSTART) || !v->playing)
-        if ((flags & DSBPLAY_FROMSTART) || frames_from_bytes(v, v->play_start) > v->pos)
-            v->pos = frames_from_bytes(v, v->play_start);
+    uint32_t pstart = frames_from_bytes(v, v->play_start);
+    uint32_t pend = v->play_len ? pstart + frames_from_bytes(v, v->play_len) : frames_from_bytes(v, v->bytes);
+    if ((flags & DSBPLAY_FROMSTART) || (!v->playing && (v->pos < pstart || v->pos >= pend)))
+        v->pos = pstart;
     v->paused = false;
     if (flags & DSBPLAY_SYNCHPLAYBACK)
         v->synch_pending = true;
@@ -869,6 +887,7 @@ static int32_t __stdcall hle_Buffer_Play(void *b, uint32_t r1, uint32_t r2, uint
 static int32_t __stdcall hle_Buffer_Stop(void *b)
 {
     VOICE(b);
+    DSTRACE("%p Stop", b);
     LOCK;
     v->playing = false;
     v->synch_pending = false;
@@ -878,6 +897,7 @@ static int32_t __stdcall hle_Buffer_Stop(void *b)
 static int32_t __stdcall hle_Buffer_StopEx(void *b, int64_t rt, uint32_t flags)
 {
     VOICE(b);
+    DSTRACE("%p StopEx %X", b, flags);
     LOCK;
     if (flags & 2) // DSBSTOPEX_RELEASEWAVEFORM: let the sound play out
         v->looping = false;
@@ -913,7 +933,8 @@ static int32_t __stdcall hle_Buffer_GetCurrentPosition(void *b, uint32_t *play, 
 {
     VOICE(b);
     LOCK;
-    uint32_t p = bytes_from_frames(v, uint32_t(v->pos));
+    uint32_t pstart = frames_from_bytes(v, v->play_start);
+    uint32_t p = bytes_from_frames(v, v->pos > pstart ? uint32_t(v->pos) - pstart : 0);
     if (play) *play = p;
     if (write) *write = p;
     return DS_OK;
@@ -922,14 +943,16 @@ static int32_t __stdcall hle_Buffer_GetCurrentPosition(void *b, uint32_t *play, 
 static int32_t __stdcall hle_Buffer_SetCurrentPosition(void *b, uint32_t pos)
 {
     VOICE(b);
+    DSTRACE("%p SetCurrentPosition %u", b, pos);
     LOCK;
-    v->pos = frames_from_bytes(v, pos);
+    v->pos = frames_from_bytes(v, v->play_start) + frames_from_bytes(v, pos); // relative to the play region
     return DS_OK;
 }
 
 static int32_t __stdcall hle_Buffer_SetFormat(void *b, const XWAVEFORMATEX *w)
 {
     VOICE(b);
+    DSTRACE("%p SetFormat tag %X ch %u rate %u bits %u", b, w ? w->wFormatTag : 0, w ? w->nChannels : 0, w ? w->nSamplesPerSec : 0, w ? w->wBitsPerSample : 0);
     LOCK;
     set_format(v, w);
     return DS_OK;
@@ -938,6 +961,7 @@ static int32_t __stdcall hle_Buffer_SetFormat(void *b, const XWAVEFORMATEX *w)
 static int32_t __stdcall hle_Buffer_SetFrequency(void *b, uint32_t f)
 {
     VOICE(b);
+    DSTRACE("%p SetFrequency %u", b, f);
     LOCK;
     v->freq = f;
     return DS_OK;
@@ -962,6 +986,7 @@ static int32_t __stdcall hle_Buffer_SetHeadroom(void *b, uint32_t hr)
 static int32_t __stdcall hle_Buffer_SetMixBins(void *b, const DSMIXBINS *mb)
 {
     VOICE(b);
+    DSTRACE("%p SetMixBins %u", b, mb ? mb->dwMixBinCount : 0);
     LOCK;
     set_mixbins(v, mb);
     return DS_OK;

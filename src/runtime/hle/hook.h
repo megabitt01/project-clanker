@@ -29,6 +29,8 @@ void hle_install_xinput();
 void hle_install_dsound();
 void hle_install_xnet();
 void hle_install_xmv_trace();
+void hle_install_enhancements(); // --60fps / --fullres (hle/enhancements.cpp)
+bool enh_widescreen();           // report the console's 16:9 setting as on
 void game_install_hooks();   // decompiled game code (src/game)
 
 } // namespace rt

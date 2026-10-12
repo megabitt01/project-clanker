@@ -312,18 +312,18 @@ GLuint depth_as_color(Surface *s)
     if (!g_conv_prog)
         init_depth_conversion();
     DepthView &v = g_depth_views[s->tex];
-    if (!v.tex || v.w != s->width || v.h != s->height) {
+    if (!v.tex || v.w != s->pw || v.h != s->ph) {
         if (!v.tex) {
             glGenTextures(1, &v.tex);
             glGenFramebuffers(1, &v.fbo);
         }
         glBindTexture(GL_TEXTURE_2D, v.tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s->width, s->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s->pw, s->ph, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, v.fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, v.tex, 0);
-        v.w = s->width;
-        v.h = s->height;
+        v.w = s->pw;
+        v.h = s->ph;
         v.gen = ~0ull;
     }
     if (v.gen == s->write_gen)
@@ -509,6 +509,9 @@ TextureBinding texture_bind_stage(int stage)
             glBindTexture(GL_TEXTURE_2D, t);
             glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, sw);
             apply_sampler(GL_TEXTURE_2D, stage, 1);
+            // Packed depth bytes cannot be interpolated (matters when scaled).
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             b.tex = t;
             b.target = GL_TEXTURE_2D;
             b.type = fi.linear ? PSH_TEX_RECT : PSH_TEX_2D;

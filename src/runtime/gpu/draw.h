@@ -12,6 +12,8 @@ void draw_clear(uint32_t flags);
 // Occlusion reports: CLEAR_REPORT_VALUE / GET_REPORT.
 void draw_report_clear();
 void draw_report_write(uint32_t parameter);
+// Writes queued reports to memory; called wherever the CPU can observe GPU progress.
+void draw_reports_resolve();
 unsigned draw_find_scanout(uint32_t addr, uint32_t &w, uint32_t &h);
 
 } // namespace rt

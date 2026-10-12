@@ -20,6 +20,7 @@ uint64_t g_start_ms;
 bool g_armed, g_active;
 int g_index, g_draw;
 int g_probe_x = -1, g_probe_y = -1;
+int g_probe2_x = -1, g_probe2_y = -1; // second probe, in render-target (scaled) pixels
 int g_shot_lo = -1, g_shot_hi = -1, g_shot_step = 0;
 FILE *g_log;
 std::string g_dir;
@@ -41,6 +42,8 @@ void init_once()
     }
     if (const char *e = getenv("SWBF2_CAPTURE_PROBE"))
         sscanf(e, "%d,%d", &g_probe_x, &g_probe_y);
+    if (const char *e = getenv("SWBF2_CAPTURE_PROBE_PX"))
+        sscanf(e, "%d,%d", &g_probe2_x, &g_probe2_y);
     if (const char *e = getenv("SWBF2_CAPTURE_SHOTS")) {
         if (sscanf(e, "%d-%d", &g_shot_lo, &g_shot_hi) != 2) {
             g_shot_lo = g_shot_hi = -1;
@@ -116,20 +119,31 @@ void capture_draw(const std::string &desc, Surface *color)
     fprintf(g_log, "#%d %s", n, desc.c_str());
     if (color && g_probe_x >= 0 && g_probe_x < int(color->width) && g_probe_y < int(color->height)) {
         uint8_t px[4];
-        glReadPixels(g_probe_x, g_probe_y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glReadPixels(int(g_probe_x * surface_scale_x()), int(g_probe_y * surface_scale_y()), 1, 1, GL_RGBA,
+                     GL_UNSIGNED_BYTE, px);
         fprintf(g_log, " probe=%02X%02X%02X%02X", px[0], px[1], px[2], px[3]);
+    }
+    if (color && g_probe2_x >= 0 && g_probe2_x < int(color->pw) && g_probe2_y < int(color->ph)) {
+        uint8_t px[4];
+        glReadPixels(g_probe2_x, g_probe2_y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        fprintf(g_log, " probe2=%02X%02X%02X%02X", px[0], px[1], px[2], px[3]);
+        uint32_t zs = 0xDEADBEEF; // unchanged when the framebuffer has no depth/stencil attachment
+        glReadPixels(g_probe2_x, g_probe2_y, 1, 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, &zs);
+        while (glGetError() != GL_NO_ERROR) {}
+        if (zs != 0xDEADBEEF)
+            fprintf(g_log, " z2=%06X", zs >> 8);
     }
     fprintf(g_log, "\n");
     bool shot = (g_shot_step > 0 && n % g_shot_step == 0) || (n >= g_shot_lo && n <= g_shot_hi);
     if (shot && color) {
-        std::vector<uint8_t> px(size_t(color->width) * color->height * 4);
+        std::vector<uint8_t> px(size_t(color->pw) * color->ph * 4);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glReadPixels(0, 0, color->width, color->height, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glReadPixels(0, 0, color->pw, color->ph, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
         for (size_t i = 3; i < px.size(); i += 4)
             px[i] = 255;
         char path[128];
         snprintf(path, sizeof path, "%s\\draw_%05d.png", g_dir.c_str(), n);
-        write_png(path, px.data(), color->width, color->height, color->width * 4);
+        write_png(path, px.data(), color->pw, color->ph, color->pw * 4);
     }
 }
 

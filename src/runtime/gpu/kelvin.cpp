@@ -191,6 +191,8 @@ void kelvin_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32
         uint32_t mod = get_mask(s, NV_PGRAPH_SURFACE_MODULO_3D);
         if (mod)
             set_mask(s, NV_PGRAPH_SURFACE_WRITE_3D, (get_mask(s, NV_PGRAPH_SURFACE_WRITE_3D) + 1) % mod);
+        if (g_draw_initialized)
+            draw_reports_resolve();
         surface_new_frame();
         texture_new_frame();
         capture_frame_boundary();
@@ -207,6 +209,8 @@ void kelvin_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32
         break;
     }
     case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE: {
+        if (g_draw_initialized)
+            draw_reports_resolve();
         DmaObject d = ctx_dma(NV097_SET_CONTEXT_DMA_SEMAPHORE);
         uint32_t off = kr(NV097_SET_SEMAPHORE_OFFSET);
         *reinterpret_cast<volatile uint32_t *>(dma_ptr(d, off)) = parameter;
@@ -260,6 +264,12 @@ void kelvin_method(std::unique_lock<std::mutex> &lk, uint32_t subchannel, uint32
     default:
         break;
     }
+}
+
+void kelvin_resolve_reports()
+{
+    if (g_draw_initialized)
+        draw_reports_resolve();
 }
 
 void kelvin_present(std::unique_lock<std::mutex> &lk)

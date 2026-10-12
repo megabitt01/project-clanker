@@ -7,6 +7,7 @@ namespace rt {
 
 struct HostConfig {
     int window_scale = 2;
+    int width = 0, height = 0; // explicit window size (0 = 640x480 * window_scale)
     bool fullscreen = false;
 };
 

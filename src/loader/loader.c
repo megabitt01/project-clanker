@@ -12,6 +12,13 @@
  * custom code section (.zldr) right after the PE header at 0x00011000. Those
  * instructions are overwritten when the XBE's .text section is copied in,
  * which is fine because control never returns here.
+ *
+ * Before anything else is loaded, the loader also reserves the other fixed
+ * ranges the Xbox code hard-codes (its RAM views at 0x80000000 and
+ * 0xF0000000 and the device registers at 0xFD000000/0xFE000000). Under Wine
+ * (Proton) native Linux libraries such as the OpenGL driver share the 32-bit
+ * address space and could otherwise land there first. The runtime releases
+ * each reservation just before mapping the range for real.
  */
 #include <windows.h>
 
@@ -38,6 +45,11 @@ void __stdcall loader_entry(void)
 {
     HMODULE rt;
     runtime_main_fn run;
+
+    VirtualAlloc((void *)0x80000000, 0x04000000, MEM_RESERVE, PAGE_NOACCESS);
+    VirtualAlloc((void *)0xF0000000, 0x04000000, MEM_RESERVE, PAGE_NOACCESS);
+    VirtualAlloc((void *)0xFD000000, 0x01000000, MEM_RESERVE, PAGE_NOACCESS);
+    VirtualAlloc((void *)0xFE000000, 0x01000000, MEM_RESERVE, PAGE_NOACCESS);
 
     /* Load from the directory that contains this EXE only. */
     SetDllDirectoryA("");

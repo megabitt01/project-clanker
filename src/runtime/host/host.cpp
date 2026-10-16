@@ -26,12 +26,21 @@ struct ScriptedPress {
     int analog;  // index into PadState::analog, or -1
     int stick;   // 0 none, 1 lx, 2 ly, 3 rx, 4 ry (held for 1 s)
     int16_t value;
+    int port;    // 0-3
 };
 static std::vector<ScriptedPress> g_script;
 static bool g_script_active;
+static uint32_t g_script_ports; // bitmask of ports driven by the script
 static uint64_t g_script_start;
 
 SDL_Window *host_window() { return g_window; }
+
+const char *host_wine_version()
+{
+    typedef const char *(__cdecl *WineGetVersion)();
+    auto fn = reinterpret_cast<WineGetVersion>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version"));
+    return fn ? fn() : nullptr;
+}
 void *host_gl_context() { return g_gl; }
 
 void host_window_size(int &w, int &h)
@@ -42,6 +51,16 @@ void host_window_size(int &w, int &h)
 void host_init(const HostConfig &cfg)
 {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (const char *wine = host_wine_version()) {
+        // Under Wine/Proton, controllers (Steam Input) are presented through
+        // XInput; SDL's other Windows backends would see the same pads again
+        // or are incomplete there. Environment variables still override.
+        LOG_INFO("host", "running under Wine %s", wine);
+        SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI, "0", SDL_HINT_DEFAULT);
+        SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_RAWINPUT, "0", SDL_HINT_DEFAULT);
+        SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_WGI, "0", SDL_HINT_DEFAULT);
+        SDL_SetHintWithPriority(SDL_HINT_DIRECTINPUT_ENABLED, "0", SDL_HINT_DEFAULT);
+    }
     SDL_SetHint(SDL_HINT_WINDOWS_DISABLE_THREAD_NAMING, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS | SDL_INIT_HAPTIC) != 0)
         fatal("SDL_Init failed: %s", SDL_GetError());
@@ -94,15 +113,28 @@ static void open_controller(int device_index)
 {
     if (!SDL_IsGameController(device_index))
         return;
-    for (int port = 0; port < MAX_PADS; port++) {
-        if (g_controllers[port])
-            continue;
-        g_controllers[port] = SDL_GameControllerOpen(device_index);
-        if (g_controllers[port]) {
-            LOG_INFO("input", "controller '%s' -> port %d", SDL_GameControllerName(g_controllers[port]), port + 1);
-            g_pad_generation++;
-        }
+    // SDL reports controllers that are already connected at startup as
+    // "added" events as well; opening them again would put one pad on two
+    // ports (it then controls two splitscreen players).
+    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(device_index);
+    for (int port = 0; port < MAX_PADS; port++)
+        if (g_controllers[port] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_controllers[port])) == id)
+            return;
+    // Prefer the port matching the controller's own player number (the
+    // XInput slot shown on its LED), so players keep their slots.
+    int port = SDL_JoystickGetDevicePlayerIndex(device_index);
+    if (port < 0 || port >= MAX_PADS || g_controllers[port]) {
+        port = -1;
+        for (int p = 0; p < MAX_PADS && port < 0; p++)
+            if (!g_controllers[p])
+                port = p;
+    }
+    if (port < 0)
         return;
+    g_controllers[port] = SDL_GameControllerOpen(device_index);
+    if (g_controllers[port]) {
+        LOG_INFO("input", "controller '%s' -> port %d", SDL_GameControllerName(g_controllers[port]), port + 1);
+        g_pad_generation++;
     }
 }
 
@@ -146,13 +178,19 @@ void host_set_input_script(const char *script)
         if (colon != std::string::npos) {
             uint32_t at = uint32_t(atoi(item.c_str()));
             std::string b = item.substr(colon + 1);
+            int port = 0; // "p2.a" presses A on port 2
+            if (b.size() > 3 && b[0] == 'p' && b[1] >= '1' && b[1] <= '4' && b[2] == '.') {
+                port = b[1] - '1';
+                b = b.substr(3);
+            }
+            g_script_ports |= 1u << port;
             for (auto &n : names)
                 if (b == n.name)
-                    g_script.push_back({at, n.bit, n.analog, 0, 0});
+                    g_script.push_back({at, n.bit, n.analog, 0, 0, port});
             static const char *sticks[] = {"lx", "ly", "rx", "ry"};
             for (int k = 0; k < 4; k++)
                 if (b.size() == 3 && b.compare(0, 2, sticks[k]) == 0)
-                    g_script.push_back({at, 0, -1, k + 1, int16_t(b[2] == '-' ? -32767 : 32767)});
+                    g_script.push_back({at, 0, -1, k + 1, int16_t(b[2] == '-' ? -32767 : 32767), port});
         }
         pos = end + 1;
     }
@@ -165,10 +203,12 @@ static void update_pads()
 {
     PadState snap[MAX_PADS] = {};
     if (g_script_active) {
-        PadState &p = snap[0];
-        p.connected = true;
+        for (int port = 0; port < MAX_PADS; port++)
+            if (g_script_ports & (1u << port))
+                snap[port].connected = true;
         uint64_t now = SDL_GetTicks64() - g_script_start;
         for (const ScriptedPress &sp : g_script) {
+            PadState &p = snap[sp.port];
             if (sp.stick && now >= sp.at_ms && now < sp.at_ms + 1000) {
                 int16_t *axes[] = {&p.lx, &p.ly, &p.rx, &p.ry};
                 *axes[sp.stick - 1] = sp.value;
@@ -180,7 +220,9 @@ static void update_pads()
             }
         }
     }
-    for (int port = g_script_active ? 1 : 0; port < MAX_PADS; port++) {
+    for (int port = 0; port < MAX_PADS; port++) {
+        if (g_script_ports & (1u << port))
+            continue;
         SDL_GameController *c = g_controllers[port];
         if (!c)
             continue;

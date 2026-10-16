@@ -17,6 +17,8 @@ void host_init(const HostConfig &cfg);
 [[noreturn]] void host_run_event_loop();
 
 SDL_Window *host_window();
+// Wine's version string when running under Wine/Proton, otherwise null.
+const char *host_wine_version();
 void *host_gl_context();
 void host_window_size(int &w, int &h);
 
@@ -34,8 +36,9 @@ void host_pad_rumble(int port, uint16_t left, uint16_t right);
 // Incremented whenever a pad is plugged in or removed.
 uint32_t host_pad_generation();
 
-// Debug/test helper: a virtual pad on port 1 that taps buttons on a
-// timeline, e.g. "5000:start,8000:a" (milliseconds since start).
+// Debug/test helper: virtual pads that tap buttons on a
+// timeline, e.g. "5000:start,8000:a" (milliseconds since start). A "pN."
+// prefix targets port N ("9000:p2.start"); scripted ports replace real pads.
 void host_set_input_script(const char *script);
 
 } // namespace rt

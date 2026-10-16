@@ -16,12 +16,23 @@ static std::map<uint32_t, uint32_t> g_allocs;   // phys base -> size in bytes
 static constexpr uint32_t PAGE = 0x1000;
 static constexpr uint32_t NUM_PAGES = XBOX_RAM_SIZE / PAGE;
 
+// The Xbox code needs fixed addresses high in the 32-bit address space. With
+// Proton's classic 32-bit Wine, native Linux libraries can occupy them.
+static const char *wine_hint()
+{
+    if (!GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version"))
+        return "";
+    return "\n\nThe address is in use by another library. Under Proton, try the launch option "
+           "PROTON_USE_WOW64=1 %command% (Proton 9 or newer), which keeps native libraries out of the 32-bit "
+           "address space.";
+}
+
 static void *map_view(uint32_t va, uint32_t offset, uint32_t size)
 {
     void *p = MapViewOfFileEx(g_ram_section, FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE, 0, offset, size,
                               reinterpret_cast<void *>(uintptr_t(va)));
     if (p != reinterpret_cast<void *>(uintptr_t(va)))
-        fatal("Could not map Xbox physical memory at 0x%08X (error %lu)", va, GetLastError());
+        fatal("Could not map Xbox physical memory at 0x%08X (error %lu).%s", va, GetLastError(), wine_hint());
     return p;
 }
 
@@ -29,7 +40,7 @@ static void reserve_noaccess(uint32_t va, uint32_t size)
 {
     void *p = VirtualAlloc(reinterpret_cast<void *>(uintptr_t(va)), size, MEM_RESERVE, PAGE_NOACCESS);
     if (p != reinterpret_cast<void *>(uintptr_t(va)))
-        fatal("Could not reserve MMIO window 0x%08X+0x%X (error %lu)", va, size, GetLastError());
+        fatal("Could not reserve MMIO window 0x%08X+0x%X (error %lu).%s", va, size, GetLastError(), wine_hint());
 }
 
 void mem_init(void *image_space, uint32_t image_space_size)
@@ -41,6 +52,11 @@ void mem_init(void *image_space, uint32_t image_space_size)
     uint32_t end = uint32_t(uintptr_t(image_space)) + image_space_size;
     if (!VirtualProtect(base, end - 0x11000, PAGE_EXECUTE_READWRITE, &old))
         fatal("VirtualProtect of the XBE image range failed (error %lu)", GetLastError());
+
+    // swbf2.exe reserved these ranges at startup so nothing else could take
+    // them; release the reservations now that they are mapped for real.
+    for (uint32_t va : {XBOX_PHYS_BASE, XBOX_PHYS_WC_BASE, NV2A_MMIO_BASE, MCPX_MMIO_BASE})
+        VirtualFree(reinterpret_cast<void *>(uintptr_t(va)), 0, MEM_RELEASE);
 
     g_ram_section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0,
                                        XBOX_RAM_SIZE, nullptr);

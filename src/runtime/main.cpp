@@ -78,10 +78,14 @@ extern "C" __declspec(dllexport) void __cdecl swbf2_runtime_main(void *space, un
         log_set_level(LogLevel::Trace);
     LOG_INFO("main", "Star Wars Battlefront II native runtime starting");
 
+    // Game files: --rom, $SWBF2_ROM, a "rom" folder next to swbf2.exe (for a
+    // copied build, e.g. on Linux with Proton), then the build's src/rom.
     std::string rom = arg_value(argc, argv.data(), "--rom");
     if (rom.empty()) {
         if (const char *env = getenv("SWBF2_ROM"))
             rom = env;
+        else if (GetFileAttributesA((dir + "\\rom\\default.xbe").c_str()) != INVALID_FILE_ATTRIBUTES)
+            rom = dir + "\\rom";
         else
             rom = SWBF2_DEFAULT_ROM_DIR;
     }

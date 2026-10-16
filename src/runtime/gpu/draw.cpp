@@ -342,13 +342,34 @@ void apply_state(Surface *color, Surface *zeta)
     }
     uint32_t pm = kr(NV097_SET_FRONT_POLYGON_MODE);
     glPolygonMode(GL_FRONT_AND_BACK, (pm == GL_POINT || pm == GL_LINE) ? pm : GL_FILL);
-    // Scissor from window clip rectangle 0 (inclusive coordinates).
+    // Scissor: the surface clip rectangle (origin and size; D3D sets it to
+    // the viewport, e.g. one half of the screen per player in splitscreen)
+    // intersected with window clip rectangle 0 (inclusive coordinates).
+    // Both are in pixels; anti-aliased surfaces hold several samples each.
     Surface *s = color ? color : zeta;
-    uint32_t wh = kr(NV097_SET_WINDOW_CLIP_HORIZONTAL), wv = kr(NV097_SET_WINDOW_CLIP_VERTICAL);
     int fx, fy;
     aa_factor(fx, fy);
-    int x0 = (wh & 0xFFFF) * fx, x1 = ((wh >> 16) + 1) * fx - 1, y0 = (wv & 0xFFFF) * fy, y1 = ((wv >> 16) + 1) * fy - 1;
-    if ((wh || wv) && x1 >= x0 && y1 >= y0 && (x0 > 0 || y0 > 0 || x1 + 1 < int(s->width) || y1 + 1 < int(s->height))) {
+    uint32_t ch = kr(NV097_SET_SURFACE_CLIP_HORIZONTAL), cv = kr(NV097_SET_SURFACE_CLIP_VERTICAL);
+    int x0 = 0, y0 = 0, x1 = int(s->width) - 1, y1 = int(s->height) - 1;
+    if (!s->swizzled && (ch >> 16) && (cv >> 16)) {
+        x0 = int(ch & 0xFFFF) * fx;
+        x1 = int((ch & 0xFFFF) + (ch >> 16)) * fx - 1;
+        y0 = int(cv & 0xFFFF) * fy;
+        y1 = int((cv & 0xFFFF) + (cv >> 16)) * fy - 1;
+    }
+    uint32_t wh = kr(NV097_SET_WINDOW_CLIP_HORIZONTAL), wv = kr(NV097_SET_WINDOW_CLIP_VERTICAL);
+    if (wh || wv) {
+        x0 = std::max(x0, int(wh & 0xFFFF) * fx);
+        x1 = std::min(x1, int((wh >> 16) + 1) * fx - 1);
+        y0 = std::max(y0, int(wv & 0xFFFF) * fy);
+        y1 = std::min(y1, int((wv >> 16) + 1) * fy - 1);
+    }
+    x1 = std::min(x1, int(s->width) - 1);
+    y1 = std::min(y1, int(s->height) - 1);
+    if (x1 < x0 || y1 < y0) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, 0, 0); // nothing visible
+    } else if (x0 > 0 || y0 > 0 || x1 + 1 < int(s->width) || y1 + 1 < int(s->height)) {
         glEnable(GL_SCISSOR_TEST);
         surface_scissor(x0, y0, x1, y1);
     } else {

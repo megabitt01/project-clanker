@@ -63,3 +63,12 @@ set_target_properties(swbf2 swbf2rt PROPERTIES
 add_custom_command(TARGET swbf2rt POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/symbols/swbf2.sym" "$<TARGET_FILE_DIR:swbf2rt>/swbf2.sym")
+
+# ---------------------------------------------------------------------------
+# Portable folder: cmake --install build --config Release --prefix <dir>
+# gives swbf2.exe, swbf2rt.dll and swbf2.sym plus an empty rom/ folder for the
+# game files. The folder runs as-is on Windows and on Linux through Proton.
+# ---------------------------------------------------------------------------
+install(TARGETS swbf2 swbf2rt RUNTIME DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/symbols/swbf2.sym" DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/rom/README.md" DESTINATION rom)
